@@ -34,6 +34,11 @@ try:
 except ImportError:
     HAS_PIL = False
 
+try:
+    from PIL import ImageFilter  # type: ignore
+except ImportError:
+    ImageFilter = None  # type: ignore
+
 
 FONT_SEARCH_PATHS = [
     # Debian / Ubuntu / Linux 常见中文字体路径
@@ -290,373 +295,239 @@ class ScheduleRenderer:
         self._font_cache[key] = font
         return font
 
-    def _text_size(self, draw: Any, text: str, font: Any) -> Tuple[int, int]:
-        if not HAS_PIL or draw is None:
-            return len(text) * 18, 26
-        clean = strip_unsupported_chars(text)
-        if not clean:
-            return 0, 0
-        try:
-            bbox = draw.textbbox((0, 0), clean, font=font)
-            return int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
-        except Exception:
-            return len(clean) * 18, 26
+    # =========================================================================
+    # 通用：课程卡片配色（根据上课状态）
+    # =========================================================================
+    @staticmethod
+    def _card_style(c: CourseInstance, idx: int) -> Dict[str, Any]:
+        v_main, v_bg, v_dark = get_vivid_theme(c.course_name, idx)
+        if c.status == "ongoing":
+            return {
+                "accent": (16, 185, 129),
+                "pill_bg": (16, 185, 129),
+                "pill_fg": (255, 255, 255),
+                "label": f"进行中 · 剩{format_duration_cn(c.wait_or_remain_minutes)}",
+                "card_bg": (255, 255, 255),
+                "outline": (110, 231, 183),
+                "title": INK,
+                "time": (4, 120, 87),
+                "tint_bg": (236, 253, 245),
+                "tint_fg": (4, 120, 87),
+                "meta": INK_2,
+                "track": (209, 250, 229),
+            }
+        if c.status == "next":
+            return {
+                "accent": (59, 130, 246),
+                "pill_bg": (37, 99, 235),
+                "pill_fg": (255, 255, 255),
+                "label": f"下一节 · {format_duration_cn(c.wait_or_remain_minutes)}后",
+                "card_bg": (255, 255, 255),
+                "outline": (147, 197, 253),
+                "title": INK,
+                "time": (30, 64, 175),
+                "tint_bg": (239, 246, 255),
+                "tint_fg": (29, 78, 216),
+                "meta": INK_2,
+                "track": (219, 234, 254),
+            }
+        if c.status == "finished":
+            return {
+                "accent": (203, 213, 225),
+                "pill_bg": (241, 245, 249),
+                "pill_fg": (100, 116, 139),
+                "label": "已下课",
+                "card_bg": (251, 252, 253),
+                "outline": None,
+                "title": (100, 116, 139),
+                "time": (148, 163, 184),
+                "tint_bg": (241, 245, 249),
+                "tint_fg": (100, 116, 139),
+                "meta": (148, 163, 184),
+                "track": (241, 245, 249),
+            }
+        return {
+            "accent": v_main,
+            "pill_bg": v_bg,
+            "pill_fg": v_dark,
+            "label": f"{c.start_time} 开课",
+            "card_bg": (255, 255, 255),
+            "outline": None,
+            "title": INK,
+            "time": INK,
+            "tint_bg": v_bg,
+            "tint_fg": v_dark,
+            "meta": INK_2,
+            "track": v_bg,
+        }
 
-    def _fit_single_line_font(
-        self,
-        draw: Any,
-        text: str,
-        max_width: int,
-        start_size: int,
-        min_size: int = 14,
-        bold: bool = True,
-    ) -> Tuple[Any, int]:
-        """自动缩放单行文本字号，使其在不截断的情况下完全放入 max_width"""
-        clean = strip_unsupported_chars(text)
-        for sz in range(start_size, min_size - 1, -1):
-            f = self._get_font(sz, bold=bold)
-            w, _ = self._text_size(draw, clean, f)
-            if w <= max_width:
-                return f, sz
-        return self._get_font(min_size, bold=bold), min_size
+    # =========================================================================
+    # 通用：单日课程卡片（左侧时间轨 + 右侧课程详情，长文本完整换行）
+    # =========================================================================
+    def _measure_course_card(self, m: Any, c: CourseInstance, w: int) -> Dict[str, Any]:
+        """预计算课程卡片的换行文本与高度，确保课程名/教室/教师/周数 100% 完整显示"""
+        if not isinstance(m, _Canvas):
+            m = _Canvas.measurer(self, draw=m, scale=1)
 
-    def _wrap_text_full(
-        self, draw: Any, text: str, font: Any, max_width: int
-    ) -> List[str]:
-        """将文本按最大像素宽度完整拆分为多行，绝不丢弃或截断任何字符"""
-        clean = strip_unsupported_chars(text)
-        if not clean:
-            return []
-        lines: List[str] = []
-        current = ""
-        for ch in clean:
-            if ch == "\n":
-                if current:
-                    lines.append(current)
-                    current = ""
-                continue
-            test = current + ch
-            w, _ = self._text_size(draw, test, font)
-            if w <= max_width or not current:
-                current = test
-            else:
-                lines.append(current)
-                current = ch
-        if current:
-            lines.append(current)
-        return lines
-
-    def _draw_text(
-        self,
-        draw: Any,
-        xy: Tuple[int, int],
-        text: str,
-        fill: Tuple[int, int, int],
-        font: Any,
-        bold_stroke: bool = False,
-    ) -> None:
-        if not HAS_PIL or draw is None:
-            return
-        clean = strip_unsupported_chars(text)
-        if not clean:
-            return
-        stroke_w = 1 if (bold_stroke and self._bold_index == self._reg_index) else 0
-        try:
-            draw.text(
-                xy,
-                clean,
-                fill=fill,
-                font=font,
-                stroke_width=stroke_w,
-                stroke_fill=fill if stroke_w > 0 else None,
-            )
-        except Exception:
-            draw.text(xy, clean, fill=fill, font=font)
-
-    def _draw_avatar(
-        self,
-        canvas: Any,
-        avatar_path: Optional[Path],
-        display_name: str,
-        x: int,
-        y: int,
-        size: int,
-        ring_color: Tuple[int, int, int] = (255, 255, 255),
-        ring_width: int = 4,
-        status_dot_color: Optional[Tuple[int, int, int]] = None,
-    ) -> None:
-        """使用 4x 超采样绘制抗锯齿圆形 QQ 头像与状态圆点"""
-        if not HAS_PIL:
-            return
-        try:
-            scale = 4
-            total_size = size + ring_width * 2
-            hi_total = total_size * scale
-            hi_size = size * scale
-
-            ring_layer = Image.new("RGBA", (hi_total, hi_total), (0, 0, 0, 0))
-            ring_draw = ImageDraw.Draw(ring_layer)
-            ring_draw.ellipse((0, 0, hi_total - 1, hi_total - 1), fill=(*ring_color, 255))
-            smooth_ring = ring_layer.resize(
-                (total_size, total_size), Image.Resampling.LANCZOS
-            )
-            canvas.paste(smooth_ring, (x - ring_width, y - ring_width), smooth_ring)
-
-            avatar_img = None
-            if avatar_path and Path(avatar_path).exists():
-                try:
-                    raw_av = Image.open(avatar_path).convert("RGBA")
-                    avatar_img = raw_av.resize((size, size), Image.Resampling.LANCZOS)
-                except Exception:
-                    avatar_img = None
-
-            if avatar_img is None:
-                primary_rgb, _, _ = get_vivid_theme(display_name)
-                avatar_img = Image.new("RGBA", (size, size), (*primary_rgb, 255))
-                av_draw = ImageDraw.Draw(avatar_img)
-                clean_name = strip_unsupported_chars(display_name) or "友"
-                first_char = clean_name[0].upper()
-                f_av = self._get_font(int(size * 0.48), bold=True)
-                tw, th = self._text_size(av_draw, first_char, f_av)
-                self._draw_text(
-                    av_draw,
-                    ((size - tw) // 2, (size - th) // 2 - int(size * 0.06)),
-                    first_char,
-                    (255, 255, 255),
-                    f_av,
-                    bold_stroke=True,
-                )
-
-            hi_mask = Image.new("L", (hi_size, hi_size), 0)
-            hi_mask_draw = ImageDraw.Draw(hi_mask)
-            hi_mask_draw.ellipse((0, 0, hi_size - 1, hi_size - 1), fill=255)
-            smooth_mask = hi_mask.resize((size, size), Image.Resampling.LANCZOS)
-            canvas.paste(avatar_img, (x, y), smooth_mask)
-
-            if status_dot_color is not None:
-                dot_d = max(22, int(size * 0.26))
-                dot_pad = 4
-                full_d = dot_d + dot_pad * 2
-                hi_full_d = full_d * scale
-                dot_layer = Image.new("RGBA", (hi_full_d, hi_full_d), (0, 0, 0, 0))
-                d_draw = ImageDraw.Draw(dot_layer)
-                d_draw.ellipse(
-                    (0, 0, hi_full_d - 1, hi_full_d - 1), fill=(255, 255, 255, 255)
-                )
-                d_draw.ellipse(
-                    (
-                        dot_pad * scale,
-                        dot_pad * scale,
-                        (full_d - dot_pad) * scale - 1,
-                        (full_d - dot_pad) * scale - 1,
-                    ),
-                    fill=(*status_dot_color, 255),
-                )
-                smooth_dot = dot_layer.resize((full_d, full_d), Image.Resampling.LANCZOS)
-                dx = x + size - full_d + 4
-                dy = y + size - full_d + 4
-                canvas.paste(smooth_dot, (dx, dy), smooth_dot)
-        except Exception:
-            pass
-
-    def _measure_course_card(
-        self, draw: Any, c: CourseInstance, w: int
-    ) -> Dict[str, Any]:
-        """预计算单张课程卡片的换行文本与所需的动态高度，确保文字 100% 完整展示"""
-        inner_w = w - 64  # 左右各留 32px 内边距
-
-        # 课程标题：若 34px 超过 2 行则自动微调到 30px，并完整保留所有换行
-        f_course = self._get_font(34, bold=True)
-        course_line_h = 44
-        course_lines = self._wrap_text_full(draw, c.course_name, f_course, inner_w)
+        inner_w = w - CARD_RAIL_W - 24
+        t_size, t_lh = 30, 40
+        course_lines = m.wrap(c.course_name, t_size, inner_w, bold=True)
         if len(course_lines) > 2:
-            f_course = self._get_font(30, bold=True)
-            course_line_h = 39
-            course_lines = self._wrap_text_full(draw, c.course_name, f_course, inner_w)
+            t_size, t_lh = 27, 36
+            course_lines = m.wrap(c.course_name, t_size, inner_w, bold=True)
+        if not course_lines:
+            course_lines = ["未命名课程"]
 
-        # 教室、教师与周数信息：合并或分行完整展示，绝不截断
-        f_meta = self._get_font(24, bold=True)
-        meta_line_h = 34
         room_clean = strip_unsupported_chars(c.room) or "未指定"
         teacher_clean = strip_unsupported_chars(c.teacher)
         week_clean = strip_unsupported_chars(getattr(c, "week_range_str", ""))
-        meta_parts = [f"教室 · {room_clean}"]
+        raw_rows: List[Tuple[str, str]] = [("教室", room_clean)]
         if teacher_clean and teacher_clean not in room_clean:
-            meta_parts.append(f"教师 · {teacher_clean}")
+            raw_rows.append(("教师", teacher_clean))
         if week_clean:
-            meta_parts.append(f"周数 · {week_clean}")
-        full_meta_str = "    ".join(meta_parts)
+            raw_rows.append(("周数", week_clean))
 
-        pill_inner_max_w = inner_w - 28
-        meta_lines = self._wrap_text_full(draw, full_meta_str, f_meta, pill_inner_max_w)
-        if not meta_lines:
-            meta_lines = ["教室 · 未指定"]
+        val_w = inner_w - META_LABEL_W
+        meta_rows: List[Tuple[str, List[str]]] = []
+        for lbl, val in raw_rows:
+            lines = m.wrap(val, 20, val_w) or [val]
+            meta_rows.append((lbl, lines))
+        meta_lines = [ln for _, lines in meta_rows for ln in lines]
 
-        meta_box_h = 16 + len(meta_lines) * meta_line_h
-        if len(meta_lines) == 1:
-            mw, _ = self._text_size(draw, meta_lines[0], f_meta)
-            meta_box_w = min(inner_w, mw + 28)
-        else:
-            meta_box_w = inner_w
-
-        # 顶部时间行 (52px) + 间距 + 标题多行 + 间距 + 教室多行胶囊 + 底部留白
-        total_h = 74 + len(course_lines) * course_line_h + 14 + meta_box_h + 22
+        right_h = 30 + 14 + len(course_lines) * t_lh + 8 + len(meta_lines) * 30
+        if c.status == "ongoing":
+            right_h += 22
+        height = max(118, right_h) + 48
         return {
-            "f_course": f_course,
+            "t_size": t_size,
             "course_lines": course_lines,
-            "course_line_h": course_line_h,
-            "f_meta": f_meta,
+            "course_line_h": t_lh,
+            "meta_rows": meta_rows,
             "meta_lines": meta_lines,
-            "meta_line_h": meta_line_h,
-            "meta_box_w": meta_box_w,
-            "meta_box_h": meta_box_h,
-            "height": max(182, total_h),
+            "height": height,
         }
 
     def _draw_course_card(
         self,
-        draw: Any,
+        cv: "_Canvas",
         c: CourseInstance,
         idx: int,
-        x: int,
-        y: int,
-        w: int,
+        x: float,
+        y: float,
+        w: float,
         layout_info: Optional[Dict[str, Any]] = None,
-    ) -> int:
-        """根据预计算的自适应布局绘制单张课程卡片，返回卡片实际高度"""
+    ) -> float:
         if layout_info is None:
-            layout_info = self._measure_course_card(draw, c, w)
-
+            layout_info = self._measure_course_card(cv, c, int(w))
         h = layout_info["height"]
-        f_time = self._get_font(32, bold=True)
-        f_node = self._get_font(21, bold=True)
+        st = self._card_style(c, idx)
 
-        vivid_main, vivid_bg, vivid_dark = get_vivid_theme(c.course_name, idx)
-
-        if c.status == "ongoing":
-            card_bg = (236, 253, 245)
-            border_col = (16, 185, 129)
-            bar_col = (5, 150, 105)
-            pill_bg = (5, 150, 105)
-            pill_fg = (255, 255, 255)
-            time_col = (6, 78, 59)
-            title_col = (6, 78, 59)
-            room_bg = (209, 250, 229)
-            room_fg = (4, 120, 87)
-            status_label = f"进行中 · 剩{format_duration_cn(c.wait_or_remain_minutes)}"
-        elif c.status == "next":
-            card_bg = (239, 246, 255)
-            border_col = (59, 130, 246)
-            bar_col = (37, 99, 235)
-            pill_bg = (37, 99, 235)
-            pill_fg = (255, 255, 255)
-            time_col = (30, 58, 138)
-            title_col = (15, 23, 42)
-            room_bg = (219, 234, 254)
-            room_fg = (29, 78, 216)
-            status_label = f"下一节 · {format_duration_cn(c.wait_or_remain_minutes)}后"
-        elif c.status == "finished":
-            card_bg = (255, 255, 255)
-            border_col = (226, 232, 240)
-            bar_col = (148, 163, 184)
-            pill_bg = (241, 245, 249)
-            pill_fg = (100, 116, 139)
-            time_col = (100, 116, 139)
-            title_col = (71, 85, 105)
-            room_bg = (241, 245, 249)
-            room_fg = (100, 116, 139)
-            status_label = "已下课"
-        else:
-            card_bg = (255, 255, 255)
-            border_col = (226, 232, 240)
-            bar_col = vivid_main
-            pill_bg = vivid_bg
-            pill_fg = vivid_dark
-            time_col = (15, 23, 42)
-            title_col = (15, 23, 42)
-            room_bg = vivid_bg
-            room_fg = vivid_dark
-            status_label = f"{c.start_time} 开课"
-
-        draw.rounded_rectangle(
+        cv.rect(
             (x, y, x + w, y + h),
-            radius=24,
-            fill=card_bg,
-            outline=border_col,
-            width=3 if c.status in ("ongoing", "next") else 2,
-        )
-        draw.rounded_rectangle(
-            (x, y + 14, x + 12, y + h - 14),
-            radius=6,
-            fill=bar_col,
+            22,
+            fill=st["card_bg"],
+            outline=st["outline"],
+            width=2 if st["outline"] else 0,
         )
 
-        # 第一行：时间段 + 节次胶囊 + 右上角自适应状态胶囊
-        time_str = f"{c.start_time} - {c.end_time}"
-        self._draw_text(
-            draw, (x + 32, y + 20), time_str, time_col, f_time, bold_stroke=True
-        )
-        tw, _ = self._text_size(draw, time_str, f_time)
+        # 左侧时间轨：开始时间（大）/ 结束时间 / 节次胶囊
+        rx = x + 26
+        cv.text(rx, y + 44, c.start_time, 32, st["time"], bold=True)
+        cv.text(rx, y + 80, c.end_time, 21, INK_3)
+        cv.pill(rx, y + 116, c.node_range_str, 16, st["tint_fg"], st["tint_bg"], pad=11, h=28)
 
-        node_txt = c.node_range_str
-        nw, _ = self._text_size(draw, node_txt, f_node)
-        nx = x + 32 + tw + 14
-        draw.rounded_rectangle(
-            (nx, y + 23, nx + nw + 22, y + 55),
-            radius=10,
-            fill=room_bg,
-        )
-        self._draw_text(
-            draw, (nx + 11, y + 27), node_txt, room_fg, f_node, bold_stroke=True
-        )
+        # 分隔色条
+        cv.rect((x + CARD_RAIL_W - 18, y + 24, x + CARD_RAIL_W - 14, y + h - 24), 2, fill=st["accent"])
 
-        # 状态胶囊自动匹配剩余宽度，确保不与左侧节次重叠
-        avail_status_w = max(90, (x + w - 24) - (nx + nw + 36))
-        f_status, _ = self._fit_single_line_font(
-            draw, status_label, avail_status_w - 28, start_size=22, min_size=15, bold=True
-        )
-        sw, _ = self._text_size(draw, status_label, f_status)
-        sx2 = x + w - 24
-        sx1 = sx2 - sw - 28
-        draw.rounded_rectangle(
-            (sx1, y + 20, sx2, y + 58),
-            radius=19,
-            fill=pill_bg,
-        )
-        self._draw_text(
-            draw, (sx1 + 14, y + 26), status_label, pill_fg, f_status, bold_stroke=True
-        )
+        cx = x + CARD_RAIL_W
+        right = x + w - 24
 
-        # 第二区：多行完整课程名称（不截断）
-        cy = y + 72
-        f_course = layout_info["f_course"]
+        # 状态胶囊
+        cv.pill(cx, y + 39, st["label"], 17, st["pill_fg"], st["pill_bg"], pad=12, h=30)
+
+        # 课程名（多行完整显示）
+        ty = y + 24 + 30 + 14
+        t_size = layout_info["t_size"]
+        t_lh = layout_info["course_line_h"]
         for line in layout_info["course_lines"]:
-            self._draw_text(
-                draw, (x + 32, cy), line, title_col, f_course, bold_stroke=True
-            )
-            cy += layout_info["course_line_h"]
+            cv.text(cx, ty + t_lh / 2, line, t_size, st["title"], bold=True)
+            ty += t_lh
 
-        # 第三区：完整教室与教师胶囊（不截断）
-        cy += 10
-        meta_box_w = layout_info["meta_box_w"]
-        meta_box_h = layout_info["meta_box_h"]
-        draw.rounded_rectangle(
-            (x + 32, cy, x + 32 + meta_box_w, cy + meta_box_h),
-            radius=12,
-            fill=room_bg,
-        )
-        f_meta = layout_info["f_meta"]
-        m_ty = cy + 7
-        for m_line in layout_info["meta_lines"]:
-            self._draw_text(
-                draw, (x + 46, m_ty), m_line, room_fg, f_meta, bold_stroke=True
-            )
-            m_ty += layout_info["meta_line_h"]
+        # 教室 / 教师 / 周数（标签 + 值，多行完整显示）
+        ty += 8
+        for lbl, lines in layout_info["meta_rows"]:
+            cv.text(cx, ty + 15, lbl, 17, INK_4, bold=True)
+            for ln in lines:
+                cv.text(cx + META_LABEL_W, ty + 15, ln, 20, st["meta"])
+                ty += 30
 
+        # 进行中课程：进度条
+        if c.status == "ongoing":
+            by = ty + 10
+            cv.rect((cx, by, right, by + 8), 4, fill=st["track"])
+            ratio = min(1.0, max(0.04, float(getattr(c, "progress", 0.0) or 0.0)))
+            cv.rect((cx, by, cx + (right - cx) * ratio, by + 8), 4, fill=st["accent"])
         return h
 
     # =========================================================================
-    # 样式一（A）：个人单日课表（支持多行完整课程名与教室名，自适应高度）
+    # 通用：渐变 Hero 头图 + 数据块
+    # =========================================================================
+    def _draw_hero_base(
+        self,
+        cv: "_Canvas",
+        box: Tuple[float, float, float, float],
+        c1: Tuple[int, int, int],
+        c2: Tuple[int, int, int],
+        shadow_col: Tuple[int, int, int],
+    ) -> None:
+        x1, y1, x2, y2 = box
+        w = x2 - x1
+        h = y2 - y1
+        cv.shadow(box, 26, dy=10, blur=18, alpha=0.30, color=shadow_col)
+        cv.gradient(
+            box,
+            26,
+            c1,
+            c2,
+            blobs=[
+                (w - 30, -10, 130, 0.10),
+                (w - 150, h + 30, 100, 0.07),
+                (w * 0.42, -60, 70, 0.05),
+            ],
+        )
+
+    def _draw_stat_tiles(
+        self,
+        cv: "_Canvas",
+        x: float,
+        y: float,
+        total_w: float,
+        items: List[Tuple[str, str, Optional[Tuple[int, int, int]]]],
+        label_col: Tuple[int, int, int],
+        value_col: Tuple[int, int, int],
+        tile_alpha: float = 0.14,
+        tile_h: float = 86,
+    ) -> None:
+        gap = 12
+        n = max(1, len(items))
+        tw = (total_w - gap * (n - 1)) / n
+        for i, (lbl, val, dot_col) in enumerate(items):
+            bx = x + i * (tw + gap)
+            cv.overlay((bx, y, bx + tw, y + tile_h), 18, (255, 255, 255), tile_alpha)
+            lx = bx + 18
+            if dot_col is not None:
+                cv.ellipse((lx, y + 21, lx + 10, y + 31), fill=dot_col)
+                lx += 18
+            cv.text(lx, y + 26, lbl, 17, label_col)
+            v_size = cv.fit(val, tw - 36, 30, 18, bold=True)
+            v_col = value_col if dot_col is None or value_col != (255, 255, 255) else value_col
+            cv.text(bx + 18, y + 60, val, v_size, v_col, bold=True)
+
+    def _draw_footer(self, cv: "_Canvas", text: str) -> None:
+        cv.text(cv.w / 2, cv.h - 30, text, 16, INK_4, anchor="mm")
+
+    # =========================================================================
+    # 样式一（A）：个人单日课表
     # =========================================================================
     def render_personal_daily(
         self,
@@ -678,7 +549,6 @@ class ScheduleRenderer:
         upcoming_courses = [
             c for c in all_courses if c.status in ("ongoing", "next", "upcoming")
         ]
-
         show_courses = upcoming_courses if (only_upcoming and upcoming_courses) else all_courses
         show_tomorrow = (
             tomorrow_preview
@@ -696,241 +566,140 @@ class ScheduleRenderer:
             self.storage.renders_dir
             / f"personal_daily_{safe_filename(profile.user_id)}_{target_date.isoformat()}_{int(time.time() * 1000) % 100000}.png"
         )
-
         if not HAS_PIL:
             out_path.write_bytes(
                 create_minimal_png(720, 920, (242, 244, 248), (79, 70, 229), 200)
             )
             return out_path
 
-        width = 720
-        pad_x = 28
-        card_w = width - pad_x * 2
-        hero_h = 268
-        course_gap = 18
+        W = 720
+        P = 24
+        CW = W - P * 2
+        HERO_H = 252
+        GAP = 16
 
-        # 预创建测量画布以精确计算每张课程卡片高度
-        dummy_img = Image.new("RGB", (32, 32))
-        dummy_draw = ImageDraw.Draw(dummy_img)
-
-        today_layouts = [
-            self._measure_course_card(dummy_draw, c, card_w) for c in show_courses
-        ]
+        m = _Canvas.measurer(self, scale=SS_MOBILE)
+        today_layouts = [self._measure_course_card(m, c, CW) for c in show_courses]
         tomorrow_layouts = (
-            [self._measure_course_card(dummy_draw, tc, card_w) for tc in show_tomorrow]
+            [self._measure_course_card(m, tc, CW) for tc in show_tomorrow]
             if show_tomorrow
             else []
         )
+        show_done_banner = bool(only_upcoming and all_courses and not upcoming_courses)
 
-        content_h = 28 + hero_h + 24
-        if only_upcoming and all_courses and not upcoming_courses:
-            content_h += 82
+        content_h = P + HERO_H + 22
+        if show_done_banner:
+            content_h += 60 + GAP
         if today_layouts:
-            content_h += sum(l["height"] + course_gap for l in today_layouts)
+            content_h += sum(l["height"] + GAP for l in today_layouts)
         else:
-            content_h += 220
-
+            content_h += (230 if show_tomorrow else 300) + GAP
         if tomorrow_layouts:
-            content_h += 68 + sum(l["height"] + course_gap for l in tomorrow_layouts)
+            content_h += 54 + sum(l["height"] + GAP for l in tomorrow_layouts)
+        H = max(560, content_h + 50)
 
-        height = max(760, content_h + 64)
+        cv = _Canvas(self, W, H, bg=BG, scale=SS_MOBILE)
+        cv.gradient((0, 0, W, 360), 0, (233, 234, 252), BG, vertical=True)
 
-        img = Image.new("RGB", (width, height), (242, 244, 248))
-        draw = ImageDraw.Draw(img)
+        # ---------------- Hero ----------------
+        hx1, hy1, hx2, hy2 = P, P, W - P, P + HERO_H
+        self._draw_hero_base(cv, (hx1, hy1, hx2, hy2), INDIGO_1, INDIGO_2, (67, 56, 202))
+        cv.avatar(avatar_path, display_name, hx1 + 24, hy1 + 26, 84, ring=(199, 191, 255), ring_w=4)
 
-        f_hero_sub = self._get_font(22, bold=False)
-        f_tag = self._get_font(24, bold=True)
-        f_stat_val = self._get_font(34, bold=True)
-        f_stat_lbl = self._get_font(20, bold=False)
-        f_sec_title = self._get_font(28, bold=True)
-        f_empty_big = self._get_font(36, bold=True)
-        f_empty_sub = self._get_font(24, bold=False)
-        f_footer = self._get_font(20, bold=False)
-
-        # 1. 顶部 Bento Hero 卡片
-        hx1, hy1 = pad_x, 28
-        hx2, hy2 = width - pad_x, 28 + hero_h
-        draw.rounded_rectangle((hx1, hy1, hx2, hy2), radius=28, fill=(30, 27, 75))
-        draw.rounded_rectangle(
-            (hx1 + 28, hy1, hx1 + 160, hy1 + 8), radius=4, fill=(99, 102, 241)
-        )
-
-        self._draw_avatar(
-            img,
-            avatar_path,
-            display_name,
-            x=hx1 + 28,
-            y=hy1 + 28,
-            size=96,
-            ring_color=(99, 102, 241),
-            ring_width=4,
-        )
-
-        # 右上角视图胶囊标签
-        tw, _ = self._text_size(draw, title_prefix, f_tag)
-        tx2 = hx2 - 28
-        tx1 = tx2 - tw - 32
-        draw.rounded_rectangle(
-            (tx1, hy1 + 32, tx2, hy1 + 80), radius=24, fill=(79, 70, 229)
-        )
-        self._draw_text(
-            draw, (tx1 + 16, hy1 + 42), title_prefix, (255, 255, 255), f_tag, bold_stroke=True
-        )
-
-        # 群昵称自适应字号，确保完整显示且不撞右上角胶囊
-        max_name_w = max(140, tx1 - (hx1 + 144) - 16)
-        f_hero_name, _ = self._fit_single_line_font(
-            draw, display_name, max_name_w, start_size=34, min_size=18, bold=True
-        )
-        self._draw_text(
-            draw,
-            (hx1 + 144, hy1 + 34),
-            display_name,
-            (255, 255, 255),
-            f_hero_name,
-            bold_stroke=True,
-        )
+        tag_x1, _ = cv.pill(hx2 - 24, hy1 + 46, title_prefix, 19, INDIGO_1, (255, 255, 255), pad=16, h=38, align="right")
+        name_w = max(140, tag_x1 - (hx1 + 128) - 14)
+        n_size = cv.fit(display_name, name_w, 32, 18, bold=True)
+        cv.text(hx1 + 128, hy1 + 50, display_name, n_size, (255, 255, 255), bold=True)
 
         week_label = (
-            f"第 {week_num}/{schedule.max_week} 周"
-            if schedule.max_week > 0
-            else f"第 {week_num} 周"
+            f"第 {week_num}/{schedule.max_week} 周" if schedule.max_week > 0 else f"第 {week_num} 周"
         )
         date_txt = f"{target_date.strftime('%m月%d日')} {weekday_str} · {week_label}"
-        self._draw_text(
-            draw, (hx1 + 144, hy1 + 84), date_txt, (199, 210, 254), f_hero_sub
+        d_size = cv.fit(date_txt, hx2 - 24 - (hx1 + 128), 20, 14)
+        cv.text(hx1 + 128, hy1 + 90, date_txt, d_size, (224, 231, 255))
+
+        self._draw_stat_tiles(
+            cv,
+            hx1 + 24,
+            hy1 + 142,
+            CW - 48,
+            [
+                ("明日课程" if "明日" in title_prefix else "今日课程", f"{len(all_courses)} 门", None),
+                ("总计节次", f"{total_nodes} 节", None),
+                ("课堂时长", f"{total_hours} 小时", None),
+            ],
+            label_col=(221, 214, 254),
+            value_col=(255, 255, 255),
         )
 
-        # 三栏 Bento 数据块
-        bento_items = [
-            ("今日课程", f"{len(all_courses)} 门"),
-            ("总计节次", f"{total_nodes} 节"),
-            ("课堂时长", f"{total_hours} 小时"),
-        ]
-        bento_w = (card_w - 56 - 24) // 3
-        for b_idx, (b_lbl, b_val) in enumerate(bento_items):
-            bx = hx1 + 28 + b_idx * (bento_w + 12)
-            by = hy1 + 148
-            draw.rounded_rectangle(
-                (bx, by, bx + bento_w, by + 94), radius=18, fill=(49, 46, 129)
-            )
-            self._draw_text(draw, (bx + 20, by + 14), b_lbl, (165, 180, 252), f_stat_lbl)
-            f_bv, _ = self._fit_single_line_font(
-                draw, b_val, bento_w - 32, start_size=34, min_size=22, bold=True
-            )
-            self._draw_text(
-                draw, (bx + 20, by + 44), b_val, (255, 255, 255), f_bv, bold_stroke=True
-            )
+        y = hy2 + 22
 
-        y_cursor = hy2 + 24
-
-        if only_upcoming and all_courses and not upcoming_courses:
-            draw.rounded_rectangle(
-                (pad_x, y_cursor, width - pad_x, y_cursor + 64),
-                radius=18,
-                fill=(209, 250, 229),
-                outline=(16, 185, 129),
-                width=2,
-            )
+        if show_done_banner:
+            cv.rect((P, y, W - P, y + 60), 18, fill=(236, 253, 245), outline=(167, 243, 208), width=1.5)
             done_msg = "今日课程已全部下课 · 以下为今日已上课程回顾"
-            dmw, _ = self._text_size(draw, done_msg, f_tag)
-            self._draw_text(
-                draw,
-                ((width - dmw) // 2, y_cursor + 17),
-                done_msg,
-                (6, 95, 70),
-                f_tag,
-                bold_stroke=True,
-            )
-            y_cursor += 82
+            fs = cv.fit(done_msg, CW - 90, 21, 15, bold=True)
+            msg_w = cv.tw(done_msg, fs, bold=True)
+            start_x = (W - (msg_w + 34)) / 2
+            cv.ellipse((start_x, y + 18, start_x + 24, y + 42), fill=(16, 185, 129))
+            cv.line([(start_x + 6.5, y + 30.5), (start_x + 10.5, y + 34.5), (start_x + 18, y + 25.5)], (255, 255, 255), 2.4)
+            cv.text(start_x + 34, y + 30, done_msg, fs, (4, 120, 87), bold=True)
+            y += 60 + GAP
 
         if show_courses:
-            for idx, (c, l_info) in enumerate(zip(show_courses, today_layouts)):
-                drawn_h = self._draw_course_card(
-                    draw, c, idx, x=pad_x, y=y_cursor, w=card_w, layout_info=l_info
-                )
-                y_cursor += drawn_h + course_gap
+            positions = []
+            yy = y
+            for l_info in today_layouts:
+                positions.append(yy)
+                yy += l_info["height"] + GAP
+            for py, l_info in zip(positions, today_layouts):
+                cv.shadow((P, py, W - P, py + l_info["height"]), 22, dy=6, blur=14, alpha=0.08)
+            for idx, (c, py, l_info) in enumerate(zip(show_courses, positions, today_layouts)):
+                self._draw_course_card(cv, c, idx, P, py, CW, l_info)
+            y = yy
         else:
-            empty_box_h = 200 if show_tomorrow else max(220, height - y_cursor - 84)
-            draw.rounded_rectangle(
-                (pad_x, y_cursor, width - pad_x, y_cursor + empty_box_h),
-                radius=26,
-                fill=(255, 255, 255),
-                outline=(226, 232, 240),
-                width=2,
-            )
-            mid_y = y_cursor + empty_box_h // 2
-            t1 = "当天无任何课程安排"
-            t2 = "全天自由支配时间 · 尽情休息或约群友吧"
-            w1, _ = self._text_size(draw, t1, f_empty_big)
-            w2, _ = self._text_size(draw, t2, f_empty_sub)
-            self._draw_text(
-                draw,
-                ((width - w1) // 2, mid_y - 36),
-                t1,
-                (15, 23, 42),
-                f_empty_big,
-                bold_stroke=True,
-            )
-            self._draw_text(
-                draw,
-                ((width - w2) // 2, mid_y + 18),
-                t2,
-                (100, 116, 139),
-                f_empty_sub,
-            )
-            y_cursor += empty_box_h + 20
+            box_h = 230 if show_tomorrow else 300
+            cv.shadow((P, y, W - P, y + box_h), 24, dy=6, blur=14, alpha=0.07)
+            cv.rect((P, y, W - P, y + box_h), 24, fill=(255, 255, 255))
+            mid = W / 2
+            icon_cy = y + box_h * 0.36
+            cv.ellipse((mid - 40, icon_cy - 40, mid + 40, icon_cy + 40), fill=(238, 242, 255))
+            cv.ellipse((mid - 20, icon_cy - 22, mid + 18, icon_cy + 16), fill=INDIGO_1)
+            cv.ellipse((mid - 10, icon_cy - 30, mid + 26, icon_cy + 6), fill=(238, 242, 255))
+            cv.text(mid, icon_cy + 70, "当天无任何课程安排", 30, INK, bold=True, anchor="mm")
+            cv.text(mid, icon_cy + 110, "全天自由支配时间 · 尽情休息或约群友吧", 20, INK_3, anchor="mm")
+            y += box_h + GAP
 
         if show_tomorrow and tomorrow_layouts:
-            self._draw_text(
-                draw,
-                (pad_x + 8, y_cursor + 12),
-                f"明日课程预览（共 {len(show_tomorrow)} 门课）",
-                (49, 46, 129),
-                f_sec_title,
-                bold_stroke=True,
-            )
-            y_cursor += 58
-            for idx, (tc, l_info) in enumerate(zip(show_tomorrow, tomorrow_layouts)):
-                drawn_h = self._draw_course_card(
-                    draw,
-                    tc,
-                    idx + 3,
-                    x=pad_x,
-                    y=y_cursor,
-                    w=card_w,
-                    layout_info=l_info,
-                )
-                y_cursor += drawn_h + course_gap
+            cv.rect((P + 4, y + 14, P + 10, y + 38), 3, fill=INDIGO_1)
+            cv.text(P + 22, y + 26, f"明日课程预览（共 {len(show_tomorrow)} 门课）", 23, INK, bold=True)
+            y += 54
+            positions = []
+            yy = y
+            for l_info in tomorrow_layouts:
+                positions.append(yy)
+                yy += l_info["height"] + GAP
+            for py, l_info in zip(positions, tomorrow_layouts):
+                cv.shadow((P, py, W - P, py + l_info["height"]), 22, dy=6, blur=14, alpha=0.08)
+            for idx, (tc, py, l_info) in enumerate(zip(show_tomorrow, positions, tomorrow_layouts)):
+                self._draw_course_card(cv, tc, idx + 3, P, py, CW, l_info)
+            y = yy
 
-        footer_str = f"AstrBot 课程表  ·  {now.strftime('%Y-%m-%d %H:%M')}"
-        fw, _ = self._text_size(draw, footer_str, f_footer)
-        self._draw_text(
-            draw,
-            ((width - fw) // 2, height - 44),
-            footer_str,
-            (148, 163, 184),
-            f_footer,
-        )
-
-        img.save(out_path, format="PNG")
+        self._draw_footer(cv, f"AstrBot 课程表  ·  {now.strftime('%Y-%m-%d %H:%M')}")
+        cv.save(out_path)
         return out_path
 
     # =========================================================================
-    # 样式一（B）：个人周课表网格（完整展示周一至周日 7 天 + 单元格字号与行高动态自适应）
+    # 样式一（B）：个人周课表网格（周一至周日 7 列 + 动态节次时间轴）
     # =========================================================================
     def _fit_weekly_cell_content(
         self,
-        draw: Any,
+        m: "_Canvas",
         c: CourseInstance,
-        inner_w: int,
-        avail_h: int,
+        inner_w: float,
+        avail_h: float,
         custom_time_str: str = "",
     ) -> Dict[str, Any]:
-        """
-        为周课表单元格自动选择最佳字号并完整换行（不截断任何课程名、教室与教师）：
-        依次尝试从大到小的字号组合，直到全部课程名 + 教室/教师完整放入单元格高度内。
-        """
+        """为周课表色块自动选择最佳字号并完整换行（不截断课程名、教室与教师）"""
         room_clean = strip_unsupported_chars(c.room)
         teacher_clean = strip_unsupported_chars(c.teacher)
         if room_clean and teacher_clean and teacher_clean not in room_clean:
@@ -941,48 +710,36 @@ class ScheduleRenderer:
             meta_str = teacher_clean
         else:
             meta_str = ""
-
         if custom_time_str:
             meta_str = f"{custom_time_str} {meta_str}".strip()
 
         size_candidates = [
-            (21, 17, 25, 21),
-            (19, 16, 23, 19),
-            (18, 15, 22, 18),
-            (16, 14, 19, 17),
-            (15, 13, 18, 16),
-            (14, 12, 16, 14),
-            (12, 11, 14, 13),
+            (20, 16, 26, 21),
+            (19, 15, 24, 20),
+            (18, 14, 23, 19),
+            (16, 13, 20, 17),
+            (15, 12, 19, 16),
+            (14, 12, 17, 15),
+            (12, 11, 15, 14),
         ]
-
-        best_plan: Optional[Dict[str, Any]] = None
+        best: Optional[Dict[str, Any]] = None
         for name_sz, meta_sz, name_lh, meta_lh in size_candidates:
-            f_name = self._get_font(name_sz, bold=True)
-            f_meta = self._get_font(meta_sz, bold=True)
-            name_lines = self._wrap_text_full(draw, c.course_name, f_name, inner_w)
-            meta_lines = (
-                self._wrap_text_full(draw, meta_str, f_meta, inner_w)
-                if meta_str
-                else []
-            )
-            needed_h = len(name_lines) * name_lh + (
-                (4 + len(meta_lines) * meta_lh) if meta_lines else 0
-            )
-            plan = {
-                "f_name": f_name,
-                "f_meta": f_meta,
+            name_lines = m.wrap(c.course_name, name_sz, inner_w, bold=True)
+            meta_lines = m.wrap(meta_str, meta_sz, inner_w) if meta_str else []
+            needed_h = len(name_lines) * name_lh + ((5 + len(meta_lines) * meta_lh) if meta_lines else 0)
+            best = {
+                "name_sz": name_sz,
+                "meta_sz": meta_sz,
                 "name_lines": name_lines,
                 "meta_lines": meta_lines,
                 "name_lh": name_lh,
                 "meta_lh": meta_lh,
                 "needed_h": needed_h,
             }
-            best_plan = plan
             if needed_h <= avail_h:
-                return plan
-
-        assert best_plan is not None
-        return best_plan
+                return best
+        assert best is not None
+        return best
 
     def render_personal_weekly(
         self,
@@ -1007,7 +764,6 @@ class ScheduleRenderer:
             self.storage.renders_dir
             / f"personal_weekly_{safe_filename(profile.user_id)}_{monday.isoformat()}_{int(time.time() * 1000) % 100000}.png"
         )
-
         if not HAS_PIL:
             out_path.write_bytes(
                 create_minimal_png(1060, 1180, (244, 246, 250), (49, 46, 129), 160)
@@ -1015,12 +771,10 @@ class ScheduleRenderer:
             return out_path
 
         max_course_node = max(
-            (c.end_node for dlist in week_courses.values() for c in dlist),
-            default=0,
+            (c.end_node for dlist in week_courses.values() for c in dlist), default=0
         )
         all_sched_node = max(
-            (c.start_node + max(1, c.step) - 1 for c in schedule.courses),
-            default=0,
+            (c.start_node + max(1, c.step) - 1 for c in schedule.courses), default=0
         )
         max_nodes = max(4, schedule.max_nodes, max_course_node, all_sched_node)
         slot_map = {s.node: s for s in schedule.time_slots}
@@ -1039,143 +793,95 @@ class ScheduleRenderer:
                 return f"{c.start_time}-{c.end_time}"
             return ""
 
-        # 完整展示周一至周日 7 列（让周六、周日课程始终清晰可见）
         num_days = 7
-        width = 1080
-        pad_x = 24
-        hero_h = 156
-        col_header_h = 78
-        left_axis_w = 96
-        grid_w = width - pad_x * 2 - left_axis_w
-        col_w = grid_w // num_days
-        inner_cell_w = col_w - 22
+        W = 1080
+        P = 24
+        HERO_H = 150
+        COL_H = 76
+        AXIS_W = 92
+        grid_w = W - P * 2 - AXIS_W
+        col_w = grid_w / num_days
+        BLOCK_INSET = 3
+        TEXT_PAD_L = 13
+        TEXT_PAD_R = 7
+        inner_cell_w = col_w - BLOCK_INSET * 2 - TEXT_PAD_L - TEXT_PAD_R
 
-        # 预测量所有课程块，若存在极长文本课程则自动增高单节行高 row_h，确保 100% 不溢出不截断
-        dummy_img = Image.new("RGB", (32, 32))
-        dummy_draw = ImageDraw.Draw(dummy_img)
-        row_h = 98
+        m = _Canvas.measurer(self, scale=SS_WEEKLY)
+        row_h = 96
         for day_list in week_courses.values():
             for c in day_list:
                 span = max(1, c.end_node - c.start_node + 1)
-                avail_h = span * row_h - 26
-                plan = self._fit_weekly_cell_content(
-                    dummy_draw, c, inner_cell_w, avail_h, _get_custom_time_tag(c)
-                )
+                avail_h = span * row_h - BLOCK_INSET * 2 - 20
+                plan = self._fit_weekly_cell_content(m, c, inner_cell_w, avail_h, _get_custom_time_tag(c))
                 if plan["needed_h"] > avail_h:
-                    req_row_h = int((plan["needed_h"] + 30) / span) + 2
-                    if req_row_h > row_h:
-                        row_h = min(140, req_row_h)
+                    req = int((plan["needed_h"] + BLOCK_INSET * 2 + 22) / span) + 2
+                    if req > row_h:
+                        row_h = min(140, req)
 
-        height = 24 + hero_h + 20 + col_header_h + max_nodes * row_h + 64
+        grid_top = P + HERO_H + 18
+        body_top = grid_top + COL_H
+        grid_bottom = body_top + max_nodes * row_h
+        H = grid_bottom + 56
 
-        img = Image.new("RGB", (width, height), (242, 244, 248))
-        draw = ImageDraw.Draw(img)
+        cv = _Canvas(self, W, H, bg=BG, scale=SS_WEEKLY)
+        cv.gradient((0, 0, W, 420), 0, (233, 234, 252), BG, vertical=True)
 
-        f_hero_sub = self._get_font(22, bold=False)
-        f_col_wd = self._get_font(23, bold=True)
-        f_col_dt = self._get_font(17, bold=False)
-        f_node_num = self._get_font(22, bold=True)
-        f_node_tm = self._get_font(16, bold=False)
+        # ---------------- Hero ----------------
+        hx1, hy1, hx2, hy2 = P, P, W - P, P + HERO_H
+        self._draw_hero_base(cv, (hx1, hy1, hx2, hy2), INDIGO_1, INDIGO_2, (67, 56, 202))
+        cv.avatar(avatar_path, display_name, hx1 + 26, hy1 + 27, 92, ring=(199, 191, 255), ring_w=4)
 
-        # 顶部 Hero 卡片
-        hx1, hy1 = pad_x, 24
-        hx2, hy2 = width - pad_x, 24 + hero_h
-        draw.rounded_rectangle((hx1, hy1, hx2, hy2), radius=26, fill=(30, 27, 75))
-
-        self._draw_avatar(
-            img,
-            avatar_path,
-            display_name,
-            x=hx1 + 26,
-            y=hy1 + 28,
-            size=100,
-            ring_color=(99, 102, 241),
-            ring_width=4,
-        )
-
-        all_wk_instances = [c for dlist in week_courses.values() for c in dlist]
-        total_wk_nodes = sum(c.step for c in all_wk_instances)
-        total_wk_hours = round(sum(c.duration_minutes for c in all_wk_instances) / 60.0, 1)
-
+        all_wk = [c for dlist in week_courses.values() for c in dlist]
+        total_wk_nodes = sum(c.step for c in all_wk)
+        total_wk_hours = round(sum(c.duration_minutes for c in all_wk) / 60.0, 1)
         week_badge = (
-            f"第 {week_num}/{schedule.max_week} 周"
-            if schedule.max_week > 0
-            else f"第 {week_num} 周"
+            f"第 {week_num}/{schedule.max_week} 周" if schedule.max_week > 0 else f"第 {week_num} 周"
         )
         head_raw = f"{display_name} · {title_prefix}（{week_badge}）"
-        f_hero_title, _ = self._fit_single_line_font(
-            draw, head_raw, (hx2 - hx1) - 180, start_size=34, min_size=20, bold=True
-        )
-        self._draw_text(
-            draw, (hx1 + 148, hy1 + 32), head_raw, (255, 255, 255), f_hero_title, bold_stroke=True
-        )
+        text_x = hx1 + 146
+        h_size = cv.fit(head_raw, hx2 - 28 - text_x, 32, 20, bold=True)
+        cv.text(text_x, hy1 + 56, head_raw, h_size, (255, 255, 255), bold=True)
         sub_str = (
-            f"{monday.strftime('%m/%d')} - {sunday.strftime('%m/%d')}（周一至周日）  ·  共 {len(all_wk_instances)} 门次 / {total_wk_nodes} 节 / {total_wk_hours} 小时"
+            f"{monday.strftime('%m/%d')} - {sunday.strftime('%m/%d')}（周一至周日）  ·  共 {len(all_wk)} 门次 / {total_wk_nodes} 节 / {total_wk_hours} 小时"
         )
-        self._draw_text(draw, (hx1 + 148, hy1 + 88), sub_str, (199, 210, 254), f_hero_sub)
+        s_size = cv.fit(sub_str, hx2 - 28 - text_x, 20, 14)
+        cv.text(text_x, hy1 + 100, sub_str, s_size, (224, 231, 255))
 
-        # 课表矩阵白底外框
-        grid_top = hy2 + 20
-        grid_bottom = grid_top + col_header_h + max_nodes * row_h
-        draw.rounded_rectangle(
-            (pad_x, grid_top, width - pad_x, grid_bottom),
-            radius=24,
-            fill=(255, 255, 255),
-            outline=(226, 232, 240),
-            width=2,
-        )
-
-        draw.rounded_rectangle(
-            (pad_x, grid_top, width - pad_x, grid_top + col_header_h),
-            radius=24,
-            fill=(248, 250, 252),
-        )
-        self._draw_text(
-            draw,
-            (pad_x + 24, grid_top + 24),
-            "节次",
-            (71, 85, 105),
-            f_col_wd,
-            bold_stroke=True,
-        )
+        # ---------------- 网格外框 ----------------
+        gx1, gx2 = P, W - P
+        cv.shadow((gx1, grid_top, gx2, grid_bottom), 24, dy=8, blur=16, alpha=0.08)
+        cv.rect((gx1, grid_top, gx2, grid_bottom), 24, fill=(255, 255, 255))
 
         today = now.date()
-        body_top = grid_top + col_header_h
+        today_idx = (today - monday).days if monday <= today <= sunday else -1
+
+        # 今日列柔和高亮（圆角整列）
+        if 0 <= today_idx < num_days:
+            tx1 = gx1 + AXIS_W + today_idx * col_w
+            cv.rect((tx1 + 3, grid_top + 6, tx1 + col_w - 3, grid_bottom - 6), 16, fill=(244, 243, 255))
+
+        # 节次表头
+        cv.text(gx1 + AXIS_W / 2, grid_top + COL_H / 2, "节次", 20, INK_3, bold=True, anchor="mm")
 
         for d_idx in range(num_days):
             cur_d = monday + timedelta(days=d_idx)
-            cx1 = pad_x + left_axis_w + d_idx * col_w
-            cx2 = cx1 + col_w
-            is_today = cur_d == today
+            cx1 = gx1 + AXIS_W + d_idx * col_w
+            mid = cx1 + col_w / 2
+            is_today = d_idx == today_idx
             if is_today:
-                draw.rectangle(
-                    (cx1, body_top, cx2, grid_bottom),
-                    fill=(245, 247, 255),
-                )
-                draw.rounded_rectangle(
-                    (cx1 + 5, grid_top + 8, cx2 - 5, grid_top + col_header_h - 8),
-                    radius=16,
-                    fill=(79, 70, 229),
-                )
-            wd_txt = WEEKDAY_NAMES[d_idx]
-            dt_txt = cur_d.strftime("%m/%d")
-            fg1 = (255, 255, 255) if is_today else (15, 23, 42)
-            fg2 = (224, 231, 255) if is_today else (100, 116, 139)
+                cv.gradient((cx1 + 8, grid_top + 10, cx1 + col_w - 8, grid_top + COL_H - 10), 14, INDIGO_1, INDIGO_2)
+                fg1, fg2 = (255, 255, 255), (224, 231, 255)
+            else:
+                is_weekend = d_idx >= 5
+                fg1 = (INK if not is_weekend else (71, 85, 105))
+                fg2 = INK_4
+            cv.text(mid, grid_top + 30, WEEKDAY_NAMES[d_idx], 21, fg1, bold=True, anchor="mm")
+            cv.text(mid, grid_top + 54, cur_d.strftime("%m/%d"), 15, fg2, anchor="mm")
 
-            w1, _ = self._text_size(draw, wd_txt, f_col_wd)
-            w2, _ = self._text_size(draw, dt_txt, f_col_dt)
-            self._draw_text(
-                draw,
-                (cx1 + (col_w - w1) // 2, grid_top + 14),
-                wd_txt,
-                fg1,
-                f_col_wd,
-                bold_stroke=True,
-            )
-            self._draw_text(
-                draw, (cx1 + (col_w - w2) // 2, grid_top + 46), dt_txt, fg2, f_col_dt
-            )
+        # 表头分割线
+        cv.line([(gx1 + 16, body_top), (gx2 - 16, body_top)], LINE, 1.2)
 
+        # 节次时间轴 + 行分割线（大课间/午休/晚休 >= 25 分钟使用靛蓝虚线）
         for node in range(1, max_nodes + 1):
             ry1 = body_top + (node - 1) * row_h
             slot = slot_map.get(node)
@@ -1183,121 +889,72 @@ class ScheduleRenderer:
             st_str = slot.start_time if slot else default_map.get(node, {}).get("start_time", "")
             et_str = slot.end_time if slot else default_map.get(node, {}).get("end_time", "")
 
-            # 动态检测大课间/午休/晚休间隙（>= 25 分钟时加粗分割线提示）
-            is_big_break = False
-            if prev_slot and st_str and prev_slot.end_time:
-                gap_mins = hhmm_to_minutes(st_str) - hhmm_to_minutes(prev_slot.end_time)
-                if gap_mins >= 25:
-                    is_big_break = True
+            if node > 1:
+                is_big_break = False
+                if prev_slot and st_str and prev_slot.end_time:
+                    gap_mins = hhmm_to_minutes(st_str) - hhmm_to_minutes(prev_slot.end_time)
+                    if gap_mins >= 25:
+                        is_big_break = True
+                if is_big_break:
+                    cv.dashed_hline(gx1 + 12, gx2 - 12, ry1, (165, 180, 252), 2, dash=9, gap=6)
+                else:
+                    cv.line([(gx1 + 16, ry1), (gx2 - 16, ry1)], LINE_SOFT, 1)
 
-            line_col = (199, 210, 254) if is_big_break else (226, 232, 240)
-            line_w = 2 if is_big_break else 1
-            draw.line((pad_x, ry1, width - pad_x, ry1), fill=line_col, width=line_w)
-
-            n_str = f"{node}"
-            nw, _ = self._text_size(draw, n_str, f_node_num)
-            self._draw_text(
-                draw,
-                (pad_x + (left_axis_w - nw) // 2, ry1 + 14),
-                n_str,
-                (30, 41, 59),
-                f_node_num,
-                bold_stroke=True,
-            )
+            ax = gx1 + AXIS_W / 2
+            cv.text(ax, ry1 + 26, f"{node}", 22, INK, bold=True, anchor="mm")
             if st_str:
-                tw, _ = self._text_size(draw, st_str, f_node_tm)
-                self._draw_text(
-                    draw,
-                    (pad_x + (left_axis_w - tw) // 2, ry1 + 44),
-                    st_str,
-                    (100, 116, 139),
-                    f_node_tm,
-                )
+                cv.text(ax, ry1 + 52, st_str, 14, INK_3, anchor="mm")
             if et_str:
-                tw, _ = self._text_size(draw, et_str, f_node_tm)
-                self._draw_text(
-                    draw,
-                    (pad_x + (left_axis_w - tw) // 2, ry1 + 64),
-                    et_str,
-                    (148, 163, 184),
-                    f_node_tm,
-                )
+                cv.text(ax, ry1 + 70, et_str, 14, INK_4, anchor="mm")
 
-        for d_idx in range(num_days + 1):
-            cx = pad_x + left_axis_w + d_idx * col_w
-            draw.line((cx, grid_top, cx, grid_bottom), fill=(226, 232, 240), width=1)
+        # 竖向分割线
+        for d_idx in range(1, num_days):
+            cx = gx1 + AXIS_W + d_idx * col_w
+            cv.line([(cx, grid_top + 18), (cx, grid_bottom - 18)], LINE_SOFT, 1)
+        cv.line([(gx1 + AXIS_W, grid_top + 18), (gx1 + AXIS_W, grid_bottom - 18)], LINE, 1.2)
 
-        # 绘制周一至周日每一天的课程色块（自适应字号，完整显示全部文字）
+        # 课程色块
         for wd, day_courses in week_courses.items():
             d_idx = wd - 1
             if not (0 <= d_idx < num_days):
                 continue
-            cx1 = pad_x + left_axis_w + d_idx * col_w + 4
-            cx2 = cx1 + col_w - 8
-
+            bx1 = gx1 + AXIS_W + d_idx * col_w + BLOCK_INSET
+            bx2 = bx1 + col_w - BLOCK_INSET * 2
             for idx, c in enumerate(day_courses):
                 s_node = max(1, min(max_nodes, c.start_node))
                 e_node = max(s_node, min(max_nodes, c.end_node))
-                cy1 = body_top + (s_node - 1) * row_h + 4
-                cy2 = body_top + e_node * row_h - 4
+                by1 = body_top + (s_node - 1) * row_h + BLOCK_INSET
+                by2 = body_top + e_node * row_h - BLOCK_INSET
 
                 v_main, v_bg, v_dark = get_vivid_theme(c.course_name, idx)
+                cv.rect((bx1, by1, bx2, by2), 12, fill=v_bg, outline=_mix(v_bg, v_main, 0.28), width=1)
+                cv.rect((bx1, by1, bx1 + 5, by2), 2.5, fill=v_main)
 
-                draw.rounded_rectangle(
-                    (cx1, cy1, cx2, cy2),
-                    radius=12,
-                    fill=v_bg,
-                    outline=v_main,
-                    width=2,
-                )
-                draw.rounded_rectangle(
-                    (cx1, cy1, cx2, min(cy2, cy1 + 8)),
-                    radius=4,
-                    fill=v_main,
-                )
-
-                cell_inner_w = (cx2 - cx1) - 14
-                cell_avail_h = (cy2 - cy1) - 18
                 plan = self._fit_weekly_cell_content(
-                    draw, c, cell_inner_w, cell_avail_h, _get_custom_time_tag(c)
+                    cv,
+                    c,
+                    (bx2 - bx1) - TEXT_PAD_L - TEXT_PAD_R,
+                    (by2 - by1) - 20,
+                    _get_custom_time_tag(c),
                 )
-
-                ty = cy1 + 12
+                tx = bx1 + TEXT_PAD_L
+                ty = by1 + 10
                 for ln in plan["name_lines"]:
-                    self._draw_text(
-                        draw,
-                        (cx1 + 7, ty),
-                        ln,
-                        v_dark,
-                        plan["f_name"],
-                        bold_stroke=True,
-                    )
+                    cv.text(tx, ty + plan["name_lh"] / 2, ln, plan["name_sz"], v_dark, bold=True)
                     ty += plan["name_lh"]
-
                 if plan["meta_lines"]:
-                    ty += 3
-                    for rln in plan["meta_lines"]:
-                        self._draw_text(
-                            draw,
-                            (cx1 + 7, ty),
-                            rln,
-                            v_main,
-                            plan["f_meta"],
-                            bold_stroke=True,
-                        )
+                    ty += 5
+                    meta_col = _mix(v_main, v_dark, 0.35)
+                    for ln in plan["meta_lines"]:
+                        cv.text(tx, ty + plan["meta_lh"] / 2, ln, plan["meta_sz"], meta_col)
                         ty += plan["meta_lh"]
 
-        footer_str = f"AstrBot 课程表  ·  第 {week_num} 周  ·  {now.strftime('%Y-%m-%d %H:%M')}"
-        fw, _ = self._text_size(draw, footer_str, f_col_dt)
-        self._draw_text(
-            draw, ((width - fw) // 2, height - 42), footer_str, (148, 163, 184), f_col_dt
-        )
-
-        img.save(out_path, format="PNG")
+        self._draw_footer(cv, f"AstrBot 课程表  ·  第 {week_num} 周  ·  {now.strftime('%Y-%m-%d %H:%M')}")
+        cv.save(out_path)
         return out_path
 
     # =========================================================================
-    # 样式二：群友课表总览（动态多行展开，完整显示长课程名与全部明日课程）
+    # 样式二：群友课表总览（实时状态 / 明日课程）
     # =========================================================================
     def render_group_overview(
         self,
@@ -1316,27 +973,25 @@ class ScheduleRenderer:
             self.storage.renders_dir
             / f"group_{'tomorrow' if is_tomorrow else 'now'}_{safe_filename(group_id or 'all')}_{int(time.time() * 1000) % 100000}.png"
         )
-
         if not HAS_PIL:
             out_path.write_bytes(
                 create_minimal_png(720, 920, (240, 245, 245), (15, 118, 110), 210)
             )
             return out_path
 
-        width = 720
-        pad_x = 28
-        card_w = width - pad_x * 2
-        hero_h = 256
-        card_gap = 20
+        W = 720
+        P = 24
+        CW = W - P * 2
+        HERO_H = 244
+        GAP = 16
+        AV = 80
+        CONTENT_X = P + 24 + AV + 24
+        BOX_X2 = W - P - 22
+        MAIN_SZ, MAIN_LH = 23, 34
+        SUB_SZ, SUB_LH = 19, 28
+        text_max_w = (BOX_X2 - CONTENT_X) - 32
 
-        dummy_img = Image.new("RGB", (32, 32))
-        dummy_draw = ImageDraw.Draw(dummy_img)
-        f_main_line = self._get_font(26, bold=True)
-        f_sub_line = self._get_font(22, bold=False)
-
-        inner_box_w = (width - pad_x - 24) - (pad_x + 140)
-        inner_text_max_w = inner_box_w - 32
-
+        m = _Canvas.measurer(self, scale=SS_MOBILE)
         rows: List[Dict[str, Any]] = []
         ongoing_count = 0
         free_count = 0
@@ -1354,43 +1009,33 @@ class ScheduleRenderer:
                 if day_courses:
                     has_class_tomorrow_count += 1
                     sort_rank = (0, day_courses[0].start_time, -len(day_courses))
-                    accent_col = (37, 99, 235)
-                    box_bg = (239, 246, 255)
-                    box_fg = (30, 58, 138)
+                    accent, box_bg, box_fg = (37, 99, 235), (239, 246, 255), (30, 58, 138)
                     total_nodes = sum(c.step for c in day_courses)
-                    early_str = (
-                        " · 早八"
-                        if parse_hhmm(day_courses[0].start_time) <= t_thresh
-                        else ""
-                    )
+                    early_str = " · 早八" if parse_hhmm(day_courses[0].start_time) <= t_thresh else ""
                     pill_txt = f"明日 {len(day_courses)} 门 ({total_nodes}节){early_str}"
-
                     main_lines: List[str] = []
                     for c in day_courses:
                         loc = f" @{c.room}" if c.room else ""
-                        item_str = f"{c.start_time}-{c.end_time} {c.course_name}{loc}"
                         main_lines.extend(
-                            self._wrap_text_full(dummy_draw, item_str, f_main_line, inner_text_max_w)
+                            m.wrap(f"{c.start_time}-{c.end_time} {c.course_name}{loc}", MAIN_SZ, text_max_w, bold=True)
                         )
-                    sub_lines = [
-                        f"第{m_week}周 · 全天共 {total_nodes} 节 · {format_duration_cn(sum(c.duration_minutes for c in day_courses))}"
-                    ]
+                    sub_lines = m.wrap(
+                        f"第{m_week}周 · 全天共 {total_nodes} 节 · {format_duration_cn(sum(c.duration_minutes for c in day_courses))}",
+                        SUB_SZ,
+                        text_max_w,
+                    )
                 else:
                     free_count += 1
                     sort_rank = (1, "99:99", 0)
-                    accent_col = (16, 185, 129)
-                    box_bg = (236, 253, 245)
-                    box_fg = (6, 95, 70)
+                    accent, box_bg, box_fg = (16, 185, 129), (236, 253, 245), (6, 95, 70)
                     pill_txt = "明天全天无课"
-                    main_lines = ["明日无任何课程安排"]
-                    sub_lines = [f"第{m_week}周 · 全天自由活动 · 可放心约饭或游戏"]
+                    main_lines = m.wrap("明日无任何课程安排", MAIN_SZ, text_max_w, bold=True)
+                    sub_lines = m.wrap(f"第{m_week}周 · 全天自由活动 · 可放心约饭或游戏", SUB_SZ, text_max_w)
             else:
                 if ongoing_c:
                     ongoing_count += 1
                     sort_rank = (0, ongoing_c.end_time, 0)
-                    accent_col = (234, 88, 12)
-                    box_bg = (255, 247, 237)
-                    box_fg = (154, 52, 18)
+                    accent, box_bg, box_fg = (234, 88, 12), (255, 247, 237), (154, 52, 18)
                     pill_txt = f"上课中 · 剩{format_duration_cn(ongoing_c.wait_or_remain_minutes)}"
                     loc = f" @{ongoing_c.room}" if ongoing_c.room else ""
                     main_raw = f"正在上：{ongoing_c.course_name}{loc}"
@@ -1400,9 +1045,7 @@ class ScheduleRenderer:
                         sub_raw = f"{ongoing_c.start_time}-{ongoing_c.end_time}（上完这节今日就下课啦）"
                 elif next_c:
                     sort_rank = (1, next_c.start_time, 0)
-                    accent_col = (37, 99, 235)
-                    box_bg = (239, 246, 255)
-                    box_fg = (30, 64, 175)
+                    accent, box_bg, box_fg = (37, 99, 235), (239, 246, 255), (30, 64, 175)
                     pill_txt = f"下一节 · {format_duration_cn(next_c.wait_or_remain_minutes)}后"
                     loc = f" @{next_c.room}" if next_c.room else ""
                     main_raw = f"下一节：{next_c.course_name}{loc}"
@@ -1410,9 +1053,7 @@ class ScheduleRenderer:
                 else:
                     free_count += 1
                     sort_rank = (2, "99:99", 0)
-                    accent_col = (16, 185, 129)
-                    box_bg = (236, 253, 245)
-                    box_fg = (6, 95, 70)
+                    accent, box_bg, box_fg = (16, 185, 129), (236, 253, 245), (6, 95, 70)
                     pill_txt = "空闲 · 随时可约"
                     if day_courses:
                         main_raw = f"今日 {len(day_courses)} 门课已全部上完"
@@ -1420,23 +1061,16 @@ class ScheduleRenderer:
                     else:
                         main_raw = "今日全天无课"
                         sub_raw = "当前完全空闲 · 随时可以约饭或开黑"
+                main_lines = m.wrap(main_raw, MAIN_SZ, text_max_w, bold=True)
+                sub_lines = m.wrap(sub_raw, SUB_SZ, text_max_w)
 
-                main_lines = self._wrap_text_full(
-                    dummy_draw, main_raw, f_main_line, inner_text_max_w
-                )
-                sub_lines = self._wrap_text_full(
-                    dummy_draw, sub_raw, f_sub_line, inner_text_max_w
-                )
-
-            inner_box_h = 24 + len(main_lines) * 35 + 8 + len(sub_lines) * 30
-            card_h = max(210, 78 + inner_box_h + 22)
-
+            inner_box_h = 16 + len(main_lines) * MAIN_LH + 4 + len(sub_lines) * SUB_LH + 14
+            card_h = max(AV + 48, 76 + inner_box_h + 22)
             rows.append(
                 {
-                    "profile": prof,
                     "display_name": prof.get_display_name(group_id),
                     "avatar_path": av_path,
-                    "accent_col": accent_col,
+                    "accent": accent,
                     "box_bg": box_bg,
                     "box_fg": box_fg,
                     "pill_txt": pill_txt,
@@ -1450,160 +1084,80 @@ class ScheduleRenderer:
 
         rows.sort(key=lambda r: r["sort_rank"])
 
-        content_h = 28 + hero_h + 24 + sum(r["card_h"] + card_gap for r in rows)
-        height = max(760, content_h + 64)
+        content_h = P + HERO_H + 22 + sum(r["card_h"] + GAP for r in rows)
+        if not rows:
+            content_h += 200
+        H = max(560, content_h + 50)
 
-        img = Image.new("RGB", (width, height), (240, 246, 246))
-        draw = ImageDraw.Draw(img)
+        cv = _Canvas(self, W, H, bg=BG_TEAL, scale=SS_MOBILE)
+        cv.gradient((0, 0, W, 360), 0, (220, 245, 242), BG_TEAL, vertical=True)
 
-        f_hero_title = self._get_font(38, bold=True)
-        f_hero_sub = self._get_font(22, bold=False)
-        f_stat_val = self._get_font(36, bold=True)
-        f_stat_lbl = self._get_font(20, bold=False)
-        f_footer = self._get_font(20, bold=False)
-
-        # 顶部 Hero 卡片
-        hx1, hy1 = pad_x, 28
-        hx2, hy2 = width - pad_x, 28 + hero_h
-        draw.rounded_rectangle((hx1, hy1, hx2, hy2), radius=28, fill=(17, 36, 42))
-        draw.rounded_rectangle(
-            (hx1 + 28, hy1, hx1 + 170, hy1 + 8), radius=4, fill=(20, 184, 166)
-        )
-
+        # ---------------- Hero ----------------
+        hx1, hy1, hx2, hy2 = P, P, W - P, P + HERO_H
+        self._draw_hero_base(cv, (hx1, hy1, hx2, hy2), TEAL_1, TEAL_2, (13, 148, 136))
         title_str = "群友明日课表总览" if is_tomorrow else "群友实时上课状态"
-        self._draw_text(
-            draw, (hx1 + 28, hy1 + 28), title_str, (255, 255, 255), f_hero_title, bold_stroke=True
-        )
+        cv.text(hx1 + 28, hy1 + 50, title_str, 34, (255, 255, 255), bold=True)
         sub_str = f"{target_date.strftime('%Y年%m月%d日')} {weekday_str}  ·  查询时间 {now.strftime('%H:%M')}"
-        self._draw_text(draw, (hx1 + 28, hy1 + 84), sub_str, (153, 246, 228), f_hero_sub)
+        cv.text(hx1 + 28, hy1 + 96, sub_str, cv.fit(sub_str, CW - 56, 20, 14), (204, 251, 241))
 
         if is_tomorrow:
             stats = [
-                ("已绑群友", f"{len(rows)} 人", (20, 184, 166)),
-                ("明日有课", f"{has_class_tomorrow_count} 人", (59, 130, 246)),
-                ("明日无课", f"{free_count} 人", (16, 185, 129)),
+                ("已绑群友", f"{len(rows)} 人", (255, 255, 255)),
+                ("明日有课", f"{has_class_tomorrow_count} 人", (147, 197, 253)),
+                ("明日无课", f"{free_count} 人", (134, 239, 172)),
             ]
         else:
             stats = [
-                ("已绑群友", f"{len(rows)} 人", (20, 184, 166)),
-                ("正在上课", f"{ongoing_count} 人", (249, 115, 22)),
-                ("空闲可约", f"{free_count} 人", (16, 185, 129)),
+                ("已绑群友", f"{len(rows)} 人", (255, 255, 255)),
+                ("正在上课", f"{ongoing_count} 人", (253, 186, 116)),
+                ("空闲可约", f"{free_count} 人", (134, 239, 172)),
             ]
-
-        bento_w = (card_w - 56 - 24) // 3
-        for s_idx, (s_lbl, s_val, s_col) in enumerate(stats):
-            bx = hx1 + 28 + s_idx * (bento_w + 12)
-            by = hy1 + 138
-            draw.rounded_rectangle(
-                (bx, by, bx + bento_w, by + 94), radius=18, fill=(26, 54, 62)
-            )
-            self._draw_text(draw, (bx + 18, by + 14), s_lbl, (153, 246, 228), f_stat_lbl)
-            self._draw_text(
-                draw, (bx + 18, by + 44), s_val, s_col, f_stat_val, bold_stroke=True
-            )
-
-        y_cursor = hy2 + 24
-
-        for row in rows:
-            dname = row["display_name"]
-            av_path = row["avatar_path"]
-            accent_col = row["accent_col"]
-            box_bg = row["box_bg"]
-            box_fg = row["box_fg"]
-            pill_txt = row["pill_txt"]
-            card_h = row["card_h"]
-
-            c_top = y_cursor
-            c_bot = y_cursor + card_h
-
-            draw.rounded_rectangle(
-                (pad_x, c_top, width - pad_x, c_bot),
-                radius=26,
-                fill=(255, 255, 255),
-                outline=(204, 235, 232),
-                width=2,
-            )
-            draw.rounded_rectangle(
-                (pad_x, c_top + 16, pad_x + 12, c_bot - 16),
-                radius=6,
-                fill=accent_col,
-            )
-
-            self._draw_avatar(
-                img,
-                av_path,
-                dname,
-                x=pad_x + 28,
-                y=c_top + 24,
-                size=92,
-                ring_color=accent_col,
-                ring_width=4,
-                status_dot_color=accent_col,
-            )
-
-            # 右上角状态胶囊
-            f_pill, _ = self._fit_single_line_font(
-                draw, pill_txt, 250, start_size=22, min_size=16, bold=True
-            )
-            pw, _ = self._text_size(draw, pill_txt, f_pill)
-            px2 = width - pad_x - 24
-            px1 = px2 - pw - 28
-            draw.rounded_rectangle(
-                (px1, c_top + 22, px2, c_top + 62),
-                radius=20,
-                fill=accent_col,
-            )
-            self._draw_text(
-                draw, (px1 + 14, c_top + 29), pill_txt, (255, 255, 255), f_pill, bold_stroke=True
-            )
-
-            # 群昵称自适应字号，确保完整显示
-            avail_name_w = max(120, px1 - (pad_x + 140) - 14)
-            f_name, _ = self._fit_single_line_font(
-                draw, dname, avail_name_w, start_size=32, min_size=18, bold=True
-            )
-            self._draw_text(
-                draw, (pad_x + 140, c_top + 24), dname, (15, 23, 42), f_name, bold_stroke=True
-            )
-
-            # 多行自适应内嵌详情框
-            ib_x1 = pad_x + 140
-            ib_x2 = width - pad_x - 24
-            ib_y1 = c_top + 78
-            ib_y2 = ib_y1 + row["inner_box_h"]
-            draw.rounded_rectangle(
-                (ib_x1, ib_y1, ib_x2, ib_y2),
-                radius=18,
-                fill=box_bg,
-            )
-
-            ty = ib_y1 + 14
-            for mln in row["main_lines"]:
-                self._draw_text(
-                    draw, (ib_x1 + 16, ty), mln, box_fg, f_main_line, bold_stroke=True
-                )
-                ty += 35
-
-            ty += 4
-            for sln in row["sub_lines"]:
-                self._draw_text(
-                    draw, (ib_x1 + 16, ty), sln, (71, 85, 105), f_sub_line
-                )
-                ty += 30
-
-            y_cursor += card_h + card_gap
-
-        footer_str = f"AstrBot 课程表  ·  {now.strftime('%Y-%m-%d %H:%M')}"
-        fw, _ = self._text_size(draw, footer_str, f_footer)
-        self._draw_text(
-            draw, ((width - fw) // 2, height - 44), footer_str, (148, 163, 184), f_footer
+        self._draw_stat_tiles(
+            cv, hx1 + 24, hy1 + 136, CW - 48, stats,
+            label_col=(204, 251, 241), value_col=(255, 255, 255), tile_alpha=0.16,
         )
 
-        img.save(out_path, format="PNG")
+        y = hy2 + 22
+        positions = []
+        yy = y
+        for r in rows:
+            positions.append(yy)
+            yy += r["card_h"] + GAP
+        for py, r in zip(positions, rows):
+            cv.shadow((P, py, W - P, py + r["card_h"]), 22, dy=6, blur=14, alpha=0.08, color=(15, 60, 60))
+
+        for py, r in zip(positions, rows):
+            accent = r["accent"]
+            cv.rect((P, py, W - P, py + r["card_h"]), 22, fill=(255, 255, 255))
+            cv.avatar(r["avatar_path"], r["display_name"], P + 24, py + 24, AV, ring=_mix(accent, (255, 255, 255), 0.55), ring_w=4, dot=accent)
+
+            px1, _ = cv.pill(BOX_X2, py + 44, r["pill_txt"], cv.fit(r["pill_txt"], 250, 18, 14, bold=True), (255, 255, 255), accent, pad=14, h=34, align="right")
+            name_w = max(120, px1 - CONTENT_X - 14)
+            cv.text(CONTENT_X, py + 44, r["display_name"], cv.fit(r["display_name"], name_w, 28, 17, bold=True), INK, bold=True)
+
+            ib_y1 = py + 76
+            ib_y2 = ib_y1 + r["inner_box_h"]
+            cv.rect((CONTENT_X, ib_y1, BOX_X2, ib_y2), 16, fill=r["box_bg"])
+            cv.rect((CONTENT_X, ib_y1 + 14, CONTENT_X + 4, ib_y2 - 14), 2, fill=_mix(accent, r["box_bg"], 0.3))
+            ty = ib_y1 + 16
+            for ln in r["main_lines"]:
+                cv.text(CONTENT_X + 18, ty + MAIN_LH / 2, ln, MAIN_SZ, r["box_fg"], bold=True)
+                ty += MAIN_LH
+            ty += 4
+            for ln in r["sub_lines"]:
+                cv.text(CONTENT_X + 18, ty + SUB_LH / 2, ln, SUB_SZ, INK_2)
+                ty += SUB_LH
+
+        if not rows:
+            cv.rect((P, y, W - P, y + 180), 22, fill=(255, 255, 255))
+            cv.text(W / 2, y + 90, "暂无已绑定课表的群友", 24, INK_3, bold=True, anchor="mm")
+
+        self._draw_footer(cv, f"AstrBot 课程表  ·  {now.strftime('%Y-%m-%d %H:%M')}")
+        cv.save(out_path)
         return out_path
 
     # =========================================================================
-    # 样式三：本周/下周上课排行榜（黑金荣耀榜，支持本周与周日下周上课情况推送）
+    # 样式三：本周/下周上课排行榜（黑金荣耀榜）
     # =========================================================================
     def render_weekly_ranking(
         self,
@@ -1627,7 +1181,6 @@ class ScheduleRenderer:
             self.storage.renders_dir
             / f"weekly_ranking_{safe_filename(group_id or 'all')}_{monday.isoformat()}_{int(time.time() * 1000) % 100000}.png"
         )
-
         if not HAS_PIL:
             out_path.write_bytes(
                 create_minimal_png(720, 920, (246, 244, 240), (217, 119, 6), 210)
@@ -1643,13 +1196,9 @@ class ScheduleRenderer:
             total_nodes = sum(c.step for c in wk_courses)
             threshold_str = getattr(prof, "early_eight_threshold", "08:00") or "08:00"
             t_thresh = parse_hhmm(threshold_str)
-            early_count = sum(
-                1 for c in wk_courses if parse_hhmm(c.start_time) <= t_thresh
-            )
-
+            early_count = sum(1 for c in wk_courses if parse_hhmm(c.start_time) <= t_thresh)
             ranking_rows.append(
                 {
-                    "profile": prof,
                     "display_name": prof.get_display_name(group_id),
                     "avatar_path": av_path,
                     "week_num": m_week,
@@ -1660,220 +1209,591 @@ class ScheduleRenderer:
                     "early_count": early_count,
                 }
             )
-
         ranking_rows.sort(
-            key=lambda x: (x["total_mins"], x["total_nodes"], x["course_count"]),
-            reverse=True,
+            key=lambda x: (x["total_mins"], x["total_nodes"], x["course_count"]), reverse=True
         )
+        max_mins = max((r["total_mins"] for r in ranking_rows), default=1) or 1
 
-        max_mins = max((r["total_mins"] for r in ranking_rows), default=1)
-        if max_mins <= 0:
-            max_mins = 1
+        W = 720
+        P = 24
+        CW = W - P * 2
+        HERO_H = 244
+        GAP = 16
+        AV = 84
+        CONTENT_X = P + 24 + AV + 26
+        RIGHT_X = W - P - 24
+        content_w = RIGHT_X - CONTENT_X
 
-        width = 720
-        pad_x = 28
-        card_w = width - pad_x * 2
-        hero_h = 256
-        row_h = 204
-        row_gap = 20
+        m = _Canvas.measurer(self, scale=SS_MOBILE)
+        for r in ranking_rows:
+            stats_str = f"第{r['week_num']}周 · 共 {r['total_nodes']} 节 · {r['course_count']} 门课 · 早八 {r['early_count']} 次"
+            st_size = m.fit(stats_str, content_w, 19, 15)
+            r["stats_size"] = st_size
+            r["stats_lines"] = m.wrap(stats_str, st_size, content_w)
+            r["card_h"] = 156 + max(1, len(r["stats_lines"])) * 28
 
-        content_h = 28 + hero_h + 24 + len(ranking_rows) * (row_h + row_gap)
-        height = max(760, content_h + 64)
+        content_h = P + HERO_H + 22 + sum(r["card_h"] + GAP for r in ranking_rows)
+        if not ranking_rows:
+            content_h += 200
+        H = max(560, content_h + 50)
 
-        img = Image.new("RGB", (width, height), (246, 244, 240))
-        draw = ImageDraw.Draw(img)
+        cv = _Canvas(self, W, H, bg=BG_WARM, scale=SS_MOBILE)
+        cv.gradient((0, 0, W, 360), 0, (241, 236, 226), BG_WARM, vertical=True)
 
-        f_hero_title = self._get_font(38, bold=True)
-        f_hero_sub = self._get_font(22, bold=False)
-        f_stat_lbl = self._get_font(20, bold=False)
-        f_rank_num = self._get_font(28, bold=True)
-        f_tag = self._get_font(21, bold=True)
-        f_hours = self._get_font(34, bold=True)
-        f_footer = self._get_font(20, bold=False)
-
-        # 顶部黑金荣耀 Hero 卡片
-        hx1, hy1 = pad_x, 28
-        hx2, hy2 = width - pad_x, 28 + hero_h
-        draw.rounded_rectangle((hx1, hy1, hx2, hy2), radius=28, fill=(24, 24, 27))
-        draw.rounded_rectangle(
-            (hx1 + 28, hy1, hx1 + 170, hy1 + 8), radius=4, fill=(245, 158, 11)
-        )
-
-        self._draw_text(
-            draw, (hx1 + 28, hy1 + 28), title_text, (255, 255, 255), f_hero_title, bold_stroke=True
-        )
+        # ---------------- Hero ----------------
+        hx1, hy1, hx2, hy2 = P, P, W - P, P + HERO_H
+        self._draw_hero_base(cv, (hx1, hy1, hx2, hy2), DARK_1, DARK_2, (40, 30, 10))
+        cv.rect((hx1 + 28, hy1, hx1 + 150, hy1 + 6), 3, fill=GOLD)
+        cv.text(hx1 + 28, hy1 + 50, title_text, cv.fit(title_text, CW - 56, 34, 22, bold=True), (255, 255, 255), bold=True)
         sub_str = f"统计周期：{monday.strftime('%m月%d日')} - {sunday.strftime('%m月%d日')}（周一至周日）"
-        self._draw_text(draw, (hx1 + 28, hy1 + 84), sub_str, (253, 230, 138), f_hero_sub)
+        cv.text(hx1 + 28, hy1 + 96, sub_str, cv.fit(sub_str, CW - 56, 20, 14), (253, 230, 138))
 
         group_total_hours = round(sum(r["total_mins"] for r in ranking_rows) / 60.0, 1)
         group_total_nodes = sum(r["total_nodes"] for r in ranking_rows)
-        stats = [
-            ("上榜人数", f"{len(ranking_rows)} 人", (251, 191, 36)),
-            ("全群总课时", f"{group_total_hours} 小时", (245, 158, 11)),
-            ("全群总节数", f"{group_total_nodes} 节", (251, 146, 60)),
-        ]
-        bento_w = (card_w - 56 - 24) // 3
-        for s_idx, (s_lbl, s_val, s_col) in enumerate(stats):
-            bx = hx1 + 28 + s_idx * (bento_w + 12)
-            by = hy1 + 138
-            draw.rounded_rectangle(
-                (bx, by, bx + bento_w, by + 94), radius=18, fill=(39, 39, 42)
-            )
-            self._draw_text(draw, (bx + 18, by + 14), s_lbl, (212, 212, 216), f_stat_lbl)
-            f_sv, _ = self._fit_single_line_font(
-                draw, s_val, bento_w - 28, start_size=34, min_size=22, bold=True
-            )
-            self._draw_text(
-                draw, (bx + 18, by + 44), s_val, s_col, f_sv, bold_stroke=True
-            )
-
-        y_cursor = hy2 + 24
-
-        for idx, r in enumerate(ranking_rows):
-            rank = idx + 1
-            c_top = y_cursor
-            c_bot = y_cursor + row_h
-
-            if rank == 1:
-                medal_col = (245, 158, 11)
-                tag_bg = (254, 243, 199)
-                tag_fg = (180, 83, 9)
-                rank_str = "NO.1"
-                title_tag = "卷王之王" if r["total_mins"] > 0 else "清闲仙人"
-            elif rank == 2:
-                medal_col = (100, 116, 139)
-                tag_bg = (241, 245, 249)
-                tag_fg = (51, 65, 85)
-                rank_str = "NO.2"
-                title_tag = "早八战神" if r["early_count"] >= 2 else "勤学标兵"
-            elif rank == 3:
-                medal_col = (217, 119, 6)
-                tag_bg = (255, 237, 213)
-                tag_fg = (154, 52, 18)
-                rank_str = "NO.3"
-                title_tag = "勤学标兵" if r["total_mins"] >= 450 else "劳逸结合"
-            else:
-                medal_col = (148, 163, 184)
-                tag_bg = (241, 245, 249)
-                tag_fg = (100, 116, 139)
-                rank_str = f"NO.{rank}"
-                title_tag = "清闲仙人" if r["total_mins"] == 0 else "摸鱼行家"
-
-            draw.rounded_rectangle(
-                (pad_x, c_top, width - pad_x, c_bot),
-                radius=26,
-                fill=(255, 255, 255),
-                outline=medal_col if rank <= 3 else (228, 228, 231),
-                width=3 if rank == 1 else 2,
-            )
-
-            self._draw_avatar(
-                img,
-                r["avatar_path"],
-                r["display_name"],
-                x=pad_x + 26,
-                y=c_top + 24,
-                size=96,
-                ring_color=medal_col,
-                ring_width=4,
-            )
-
-            rw, _ = self._text_size(draw, rank_str, f_rank_num)
-            rx1 = pad_x + 26 + (96 - (rw + 28)) // 2
-            ry1 = c_top + 134
-            draw.rounded_rectangle(
-                (rx1, ry1, rx1 + rw + 28, ry1 + 42),
-                radius=14,
-                fill=medal_col,
-            )
-            self._draw_text(
-                draw, (rx1 + 14, ry1 + 6), rank_str, (255, 255, 255), f_rank_num, bold_stroke=True
-            )
-
-            # 右上角称号胶囊
-            tw, _ = self._text_size(draw, title_tag, f_tag)
-            tx2 = width - pad_x - 24
-            tx1 = tx2 - tw - 28
-            draw.rounded_rectangle(
-                (tx1, c_top + 24, tx2, c_top + 62),
-                radius=19,
-                fill=tag_bg,
-            )
-            self._draw_text(
-                draw, (tx1 + 14, c_top + 31), title_tag, tag_fg, f_tag, bold_stroke=True
-            )
-
-            # 群昵称自适应字号，确保完整显示
-            avail_name_w = max(120, tx1 - (pad_x + 148) - 14)
-            f_name, _ = self._fit_single_line_font(
-                draw, r["display_name"], avail_name_w, start_size=32, min_size=18, bold=True
-            )
-            self._draw_text(
-                draw,
-                (pad_x + 148, c_top + 24),
-                r["display_name"],
-                (15, 23, 42),
-                f_name,
-                bold_stroke=True,
-            )
-
-            # 第二行：大字时长 + 自适应字号的节数与早八统计（绝不截断“早八 X 次”）
-            hours_str = f"{r['total_hours']} 小时"
-            self._draw_text(
-                draw,
-                (pad_x + 148, c_top + 80),
-                hours_str,
-                medal_col if rank == 1 else (15, 23, 42),
-                f_hours,
-                bold_stroke=True,
-            )
-            hw, _ = self._text_size(draw, hours_str, f_hours)
-
-            nodes_str = f"第{r['week_num']}周 · 共 {r['total_nodes']} 节 · {r['course_count']} 门课 · 早八 {r['early_count']} 次"
-            avail_nodes_w = (width - pad_x - 24) - (pad_x + 148 + hw + 16)
-            f_nodes_fit, fitted_sz = self._fit_single_line_font(
-                draw, nodes_str, avail_nodes_w, start_size=23, min_size=15, bold=True
-            )
-            y_offset = 88 + max(0, (23 - fitted_sz) // 2)
-            self._draw_text(
-                draw,
-                (pad_x + 148 + hw + 16, c_top + y_offset),
-                nodes_str,
-                (100, 116, 139),
-                f_nodes_fit,
-                bold_stroke=True,
-            )
-
-            # 第三行：加粗鲜明进度条
-            bar_x1 = pad_x + 148
-            bar_x2 = width - pad_x - 24
-            bar_y = c_top + 148
-            draw.rounded_rectangle(
-                (bar_x1, bar_y, bar_x2, bar_y + 22),
-                radius=11,
-                fill=(241, 245, 249),
-            )
-            ratio = (
-                min(1.0, max(0.06, r["total_mins"] / max_mins))
-                if r["total_mins"] > 0
-                else 0.04
-            )
-            fill_w = max(24, int((bar_x2 - bar_x1) * ratio))
-            draw.rounded_rectangle(
-                (bar_x1, bar_y, bar_x1 + fill_w, bar_y + 22),
-                radius=11,
-                fill=medal_col
-                if rank == 1
-                else ((37, 99, 235) if rank == 2 else (13, 148, 136)),
-            )
-
-            y_cursor += row_h + row_gap
-
-        footer_str = f"AstrBot 课程表  ·  {now.strftime('%Y-%m-%d %H:%M')}"
-        fw, _ = self._text_size(draw, footer_str, f_footer)
-        self._draw_text(
-            draw, ((width - fw) // 2, height - 44), footer_str, (148, 163, 184), f_footer
+        self._draw_stat_tiles(
+            cv, hx1 + 24, hy1 + 136, CW - 48,
+            [
+                ("上榜人数", f"{len(ranking_rows)} 人", None),
+                ("全群总课时", f"{group_total_hours} 小时", None),
+                ("全群总节数", f"{group_total_nodes} 节", None),
+            ],
+            label_col=(212, 212, 216), value_col=(252, 211, 77), tile_alpha=0.08,
         )
 
-        img.save(out_path, format="PNG")
+        y = hy2 + 22
+        positions = []
+        yy = y
+        for r in ranking_rows:
+            positions.append(yy)
+            yy += r["card_h"] + GAP
+        for idx, (py, r) in enumerate(zip(positions, ranking_rows)):
+            sh_col = (180, 120, 0) if idx == 0 else (40, 30, 20)
+            cv.shadow((P, py, W - P, py + r["card_h"]), 22, dy=6, blur=14, alpha=0.12 if idx == 0 else 0.07, color=sh_col)
+
+        for idx, (py, r) in enumerate(zip(positions, ranking_rows)):
+            rank = idx + 1
+            if rank == 1:
+                medal = (245, 158, 11)
+                ring = (252, 211, 77)
+                card_bg = (255, 251, 235)
+                outline = (253, 230, 138)
+                tag_bg, tag_fg = (254, 243, 199), (180, 83, 9)
+                bar = ((251, 191, 36), (245, 158, 11))
+                title_tag = "卷王之王" if r["total_mins"] > 0 else "清闲仙人"
+            elif rank == 2:
+                medal = (100, 116, 139)
+                ring = (203, 213, 225)
+                card_bg = (255, 255, 255)
+                outline = (226, 232, 240)
+                tag_bg, tag_fg = (241, 245, 249), (51, 65, 85)
+                bar = ((96, 165, 250), (37, 99, 235))
+                title_tag = "早八战神" if r["early_count"] >= 2 else "勤学标兵"
+            elif rank == 3:
+                medal = (217, 119, 6)
+                ring = (253, 186, 116)
+                card_bg = (255, 255, 255)
+                outline = (254, 215, 170)
+                tag_bg, tag_fg = (255, 237, 213), (154, 52, 18)
+                bar = ((45, 212, 191), (13, 148, 136))
+                title_tag = "勤学标兵" if r["total_mins"] >= 450 else "劳逸结合"
+            else:
+                medal = (148, 163, 184)
+                ring = (226, 232, 240)
+                card_bg = (255, 255, 255)
+                outline = None
+                tag_bg, tag_fg = (241, 245, 249), (100, 116, 139)
+                bar = ((203, 213, 225), (148, 163, 184))
+                title_tag = "清闲仙人" if r["total_mins"] == 0 else "摸鱼行家"
+            rank_str = f"NO.{rank}"
+
+            ch = r["card_h"]
+            cv.rect((P, py, W - P, py + ch), 22, fill=card_bg, outline=outline, width=1.5 if outline else 0)
+
+            av_x = P + 24
+            av_y = py + 24
+            cv.avatar(r["avatar_path"], r["display_name"], av_x, av_y, AV, ring=ring, ring_w=4)
+            cv.pill(av_x + AV / 2, av_y + AV + 8, rank_str, 16, (255, 255, 255), medal, pad=12, h=28, align="center", outline=(255, 255, 255))
+
+            tag_x1, _ = cv.pill(RIGHT_X, py + 42, title_tag, 17, tag_fg, tag_bg, pad=13, h=32, align="right")
+            name_w = max(120, tag_x1 - CONTENT_X - 12)
+            cv.text(CONTENT_X, py + 42, r["display_name"], cv.fit(r["display_name"], name_w, 28, 17, bold=True), INK, bold=True)
+
+            hours_val = f"{r['total_hours']}"
+            hv_col = (217, 119, 6) if rank == 1 else INK
+            cv.text(CONTENT_X, py + 88, hours_val, 36, hv_col, bold=True)
+            hw = cv.tw(hours_val, 36, bold=True)
+            cv.text(CONTENT_X + hw + 6, py + 94, "小时", 19, INK_3, bold=True)
+
+            ty = py + 118
+            for ln in r["stats_lines"]:
+                cv.text(CONTENT_X, ty + 14, ln, r["stats_size"], INK_3)
+                ty += 28
+
+            bar_y = ty + 10
+            cv.rect((CONTENT_X, bar_y, RIGHT_X, bar_y + 12), 6, fill=(241, 241, 244))
+            ratio = min(1.0, max(0.06, r["total_mins"] / max_mins)) if r["total_mins"] > 0 else 0.04
+            fill_w = max(14, (RIGHT_X - CONTENT_X) * ratio)
+            cv.gradient((CONTENT_X, bar_y, CONTENT_X + fill_w, bar_y + 12), 6, bar[0], bar[1])
+
+        if not ranking_rows:
+            cv.rect((P, y, W - P, y + 180), 22, fill=(255, 255, 255))
+            cv.text(W / 2, y + 90, "暂无已绑定课表的群友", 24, INK_3, bold=True, anchor="mm")
+
+        self._draw_footer(cv, f"AstrBot 课程表  ·  {now.strftime('%Y-%m-%d %H:%M')}")
+        cv.save(out_path)
         return out_path
+
+
+# =============================================================================
+# 设计系统常量
+# =============================================================================
+SS_MOBILE = 3  # 手机竖版图片内部超采样倍率
+SS_WEEKLY = 2  # 周课表内部超采样倍率
+OUT_SCALE = 1.5  # 最终输出倍率（逻辑 720px → 1080px 高清输出）
+
+CARD_RAIL_W = 152
+META_LABEL_W = 52
+
+BG = (244, 245, 250)
+BG_TEAL = (240, 247, 246)
+BG_WARM = (247, 245, 241)
+INK = (15, 23, 42)
+INK_2 = (51, 65, 85)
+INK_3 = (100, 116, 139)
+INK_4 = (148, 163, 184)
+LINE = (226, 232, 240)
+LINE_SOFT = (238, 241, 246)
+
+INDIGO_1 = (79, 70, 229)
+INDIGO_2 = (139, 92, 246)
+TEAL_1 = (13, 148, 136)
+TEAL_2 = (6, 182, 212)
+DARK_1 = (24, 24, 27)
+DARK_2 = (68, 52, 24)
+GOLD = (245, 158, 11)
+
+
+def _mix(c1: Tuple[int, int, int], c2: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+    t = max(0.0, min(1.0, t))
+    return tuple(int(round(a + (b - a) * t)) for a, b in zip(c1, c2))  # type: ignore
+
+
+def _lanczos() -> Any:
+    rs = getattr(Image, "Resampling", None)
+    if rs is not None and hasattr(rs, "LANCZOS"):
+        return rs.LANCZOS
+    return getattr(Image, "LANCZOS", 1)
+
+
+class _Canvas:
+    """
+    逻辑坐标画布：所有布局使用逻辑像素书写，内部以 scale 倍超采样绘制，
+    最终 LANCZOS 缩放输出为 OUT_SCALE 倍高清图，实现圆角/圆形/文字的抗锯齿。
+    """
+
+    def __init__(
+        self,
+        renderer: "ScheduleRenderer",
+        width: float,
+        height: float,
+        bg: Tuple[int, int, int] = BG,
+        scale: float = 3,
+        draw: Any = None,
+    ):
+        self.r = renderer
+        self.w = width
+        self.h = height
+        self.s = scale
+        if draw is not None:
+            self.img = None
+            self.draw = draw
+        else:
+            self.img = Image.new("RGB", (self.S(width), self.S(height)), bg)
+            self.draw = ImageDraw.Draw(self.img)
+
+    @classmethod
+    def measurer(cls, renderer: "ScheduleRenderer", draw: Any = None, scale: float = 1) -> "_Canvas":
+        if draw is None:
+            draw = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+        return cls(renderer, 0, 0, scale=scale, draw=draw)
+
+    # ---------------- 基础换算 ----------------
+    def S(self, v: float) -> int:
+        return int(round(v * self.s))
+
+    def box(self, b: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
+        return (self.S(b[0]), self.S(b[1]), self.S(b[2]), self.S(b[3]))
+
+    def font(self, size: float, bold: bool = False) -> Any:
+        return self.r._get_font(max(6, int(round(size * self.s))), bold)
+
+    # ---------------- 文字测量 ----------------
+    def measure(self, text: str, size: float, bold: bool = False) -> Tuple[float, float]:
+        clean = strip_unsupported_chars(text)
+        if not clean:
+            return 0.0, 0.0
+        f = self.font(size, bold)
+        try:
+            bb = self.draw.textbbox((0, 0), clean, font=f)
+            return (bb[2] - bb[0]) / self.s, (bb[3] - bb[1]) / self.s
+        except Exception:
+            return len(clean) * size * 0.95, size * 1.2
+
+    def tw(self, text: str, size: float, bold: bool = False) -> float:
+        return self.measure(text, size, bold)[0]
+
+    def fit(self, text: str, max_w: float, start: int, min_size: int = 14, bold: bool = False) -> int:
+        for sz in range(int(start), int(min_size) - 1, -1):
+            if self.tw(text, sz, bold) <= max_w:
+                return sz
+        return int(min_size)
+
+    def wrap(self, text: str, size: float, max_w: float, bold: bool = False) -> List[str]:
+        """按像素宽度完整换行（智能保持数字/英文单词与括号完整性，绝不丢弃任何字符）"""
+        clean = strip_unsupported_chars(text)
+        if not clean:
+            return []
+        if self.tw(clean, size, bold) <= max_w and "\n" not in clean:
+            return [clean]
+
+        # 将连续的英文/数字、前导括号+字符、后置括号与单字拆分为原子词元，避免把教室号 "4101" 拆成 "4" + "101"
+        tokens: List[str] = []
+        i = 0
+        n = len(clean)
+        open_brackets = "（(《【["
+        close_brackets = "）)》】]·,，。、:："
+        while i < n:
+            ch = clean[i]
+            if ch == "\n":
+                tokens.append("\n")
+                i += 1
+                continue
+            if ch.isascii() and (ch.isalnum() or ch in "-_.:"):
+                j = i + 1
+                while j < n and clean[j].isascii() and (clean[j].isalnum() or clean[j] in "-_.:"):
+                    j += 1
+                tok = clean[i:j]
+                i = j
+            elif ch in open_brackets and i + 1 < n and clean[i + 1] != "\n":
+                tok = clean[i : i + 2]
+                i += 2
+            else:
+                tok = ch
+                i += 1
+            while i < n and clean[i] in close_brackets:
+                tok += clean[i]
+                i += 1
+            tokens.append(tok)
+
+        lines: List[str] = []
+        current = ""
+
+        def _push_char_by_char(s: str) -> None:
+            nonlocal current
+            for c in s:
+                test_c = current + c
+                if not current or self.tw(test_c, size, bold) <= max_w:
+                    current = test_c
+                else:
+                    lines.append(current)
+                    current = c
+
+        for tok in tokens:
+            if tok == "\n":
+                if current:
+                    lines.append(current)
+                    current = ""
+                continue
+            test = current + tok
+            if not current:
+                if self.tw(tok, size, bold) <= max_w:
+                    current = tok
+                else:
+                    _push_char_by_char(tok)
+            elif self.tw(test, size, bold) <= max_w:
+                current = test
+            else:
+                lines.append(current)
+                current = ""
+                if self.tw(tok, size, bold) <= max_w:
+                    current = tok
+                else:
+                    _push_char_by_char(tok)
+        if current:
+            lines.append(current)
+        return lines
+
+    # ---------------- 绘制原语 ----------------
+    def text(
+        self,
+        x: float,
+        y: float,
+        text: str,
+        size: float,
+        color: Tuple[int, int, int],
+        bold: bool = False,
+        anchor: str = "lm",
+    ) -> None:
+        clean = strip_unsupported_chars(text)
+        if not clean:
+            return
+        f = self.font(size, bold)
+        sw = max(1, int(self.s * 0.45)) if (bold and self.r._bold_index == self.r._reg_index) else 0
+        try:
+            self.draw.text(
+                (self.S(x), self.S(y)),
+                clean,
+                fill=color,
+                font=f,
+                anchor=anchor,
+                stroke_width=sw,
+                stroke_fill=color if sw else None,
+            )
+        except Exception:
+            try:
+                tw, th = self.measure(clean, size, bold)
+                ox = x - (tw / 2 if anchor[0] == "m" else (tw if anchor[0] == "r" else 0))
+                oy = y - th / 2
+                self.draw.text((self.S(ox), self.S(oy)), clean, fill=color, font=f)
+            except Exception:
+                pass
+
+    def rect(
+        self,
+        b: Tuple[float, float, float, float],
+        r: float = 0,
+        fill: Any = None,
+        outline: Any = None,
+        width: float = 0,
+    ) -> None:
+        x1, y1, x2, y2 = b
+        if x2 <= x1 or y2 <= y1:
+            return
+        rr = min(r, (x2 - x1) / 2, (y2 - y1) / 2)
+        wpx = max(1, self.S(width)) if (outline is not None and width) else 0
+        try:
+            if rr > 0:
+                self.draw.rounded_rectangle(
+                    self.box(b), radius=self.S(rr), fill=fill,
+                    outline=outline if wpx else None, width=wpx,
+                )
+            else:
+                self.draw.rectangle(
+                    self.box(b), fill=fill, outline=outline if wpx else None, width=wpx
+                )
+        except Exception:
+            try:
+                self.draw.rectangle(self.box(b), fill=fill)
+            except Exception:
+                pass
+
+    def ellipse(self, b: Tuple[float, float, float, float], fill: Any = None) -> None:
+        try:
+            self.draw.ellipse(self.box(b), fill=fill)
+        except Exception:
+            pass
+
+    def line(self, pts: List[Tuple[float, float]], color: Tuple[int, int, int], width: float = 1) -> None:
+        try:
+            self.draw.line(
+                [(self.S(px), self.S(py)) for px, py in pts],
+                fill=color,
+                width=max(1, self.S(width)),
+                joint="curve",
+            )
+        except Exception:
+            try:
+                self.draw.line([(self.S(px), self.S(py)) for px, py in pts], fill=color, width=max(1, self.S(width)))
+            except Exception:
+                pass
+
+    def dashed_hline(
+        self, x1: float, x2: float, y: float, color: Tuple[int, int, int],
+        width: float = 1, dash: float = 8, gap: float = 6,
+    ) -> None:
+        x = x1
+        while x < x2:
+            self.line([(x, y), (min(x + dash, x2), y)], color, width)
+            x += dash + gap
+
+    def pill(
+        self,
+        x: float,
+        cy: float,
+        text: str,
+        size: float,
+        fg: Tuple[int, int, int],
+        bg: Tuple[int, int, int],
+        pad: float = 14,
+        h: Optional[float] = None,
+        bold: bool = True,
+        align: str = "left",
+        outline: Optional[Tuple[int, int, int]] = None,
+    ) -> Tuple[float, float]:
+        t_w = self.tw(text, size, bold)
+        ph = h or (size + 16)
+        if align == "right":
+            x2 = x
+            x1 = x2 - t_w - pad * 2
+        elif align == "center":
+            x1 = x - t_w / 2 - pad
+            x2 = x + t_w / 2 + pad
+        else:
+            x1 = x
+            x2 = x + t_w + pad * 2
+        self.rect((x1, cy - ph / 2, x2, cy + ph / 2), ph / 2, fill=bg, outline=outline, width=2 if outline else 0)
+        self.text((x1 + x2) / 2, cy, text, size, fg, bold=bold, anchor="mm")
+        return x1, x2
+
+    # ---------------- 高级效果（失败时安全降级） ----------------
+    def overlay(
+        self, b: Tuple[float, float, float, float], r: float,
+        color: Tuple[int, int, int], alpha: float,
+    ) -> None:
+        if self.img is None:
+            return
+        try:
+            bb = self.box(b)
+            w, h = bb[2] - bb[0], bb[3] - bb[1]
+            if w <= 0 or h <= 0:
+                return
+            mask = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (0, 0, w - 1, h - 1), radius=self.S(min(r, (b[2] - b[0]) / 2, (b[3] - b[1]) / 2)),
+                fill=int(255 * alpha),
+            )
+            self.img.paste(color, bb, mask)
+        except Exception:
+            pass
+
+    def shadow(
+        self,
+        b: Tuple[float, float, float, float],
+        r: float,
+        dy: float = 6,
+        blur: float = 14,
+        alpha: float = 0.10,
+        color: Tuple[int, int, int] = (15, 23, 42),
+    ) -> None:
+        if self.img is None or ImageFilter is None:
+            return
+        try:
+            x1, y1, x2, y2 = b
+            pad = blur * 2
+            w = self.S(x2 - x1 + pad * 2)
+            h = self.S(y2 - y1 + pad * 2)
+            mask = Image.new("L", (w, h), 0)
+            rr = min(r, (x2 - x1) / 2, (y2 - y1) / 2)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (self.S(pad), self.S(pad), self.S(pad + x2 - x1), self.S(pad + y2 - y1)),
+                radius=self.S(rr),
+                fill=int(255 * alpha),
+            )
+            mask = mask.filter(ImageFilter.GaussianBlur(self.S(blur) / 2))
+            ox = self.S(x1 - pad)
+            oy = self.S(y1 - pad + dy)
+            self.img.paste(color, (ox, oy, ox + w, oy + h), mask)
+        except Exception:
+            pass
+
+    def gradient(
+        self,
+        b: Tuple[float, float, float, float],
+        r: float,
+        c1: Tuple[int, int, int],
+        c2: Tuple[int, int, int],
+        vertical: bool = False,
+        blobs: Optional[List[Tuple[float, float, float, float]]] = None,
+    ) -> None:
+        if self.img is None:
+            return
+        bb = self.box(b)
+        w, h = bb[2] - bb[0], bb[3] - bb[1]
+        if w <= 0 or h <= 0:
+            return
+        try:
+            tile = Image.new("RGB", (w, h), c1)
+            td = ImageDraw.Draw(tile)
+            n = h if vertical else w
+            step = 2
+            for i in range(0, n, step):
+                col = _mix(c1, c2, i / max(1, n - 1))
+                if vertical:
+                    td.rectangle((0, i, w, i + step), fill=col)
+                else:
+                    td.rectangle((i, 0, i + step, h), fill=col)
+            for bx, by, br, ba in blobs or []:
+                bm = Image.new("L", (w, h), 0)
+                ImageDraw.Draw(bm).ellipse(
+                    (self.S(bx - br), self.S(by - br), self.S(bx + br), self.S(by + br)),
+                    fill=int(255 * ba),
+                )
+                tile.paste((255, 255, 255), (0, 0, w, h), bm)
+            rr = min(r, (b[2] - b[0]) / 2, (b[3] - b[1]) / 2)
+            if rr > 0:
+                mask = Image.new("L", (w, h), 0)
+                ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=self.S(rr), fill=255)
+                self.img.paste(tile, (bb[0], bb[1]), mask)
+            else:
+                self.img.paste(tile, (bb[0], bb[1]))
+        except Exception:
+            self.rect(b, r, fill=c1)
+
+    def avatar(
+        self,
+        path: Optional[Path],
+        name: str,
+        x: float,
+        y: float,
+        size: float,
+        ring: Optional[Tuple[int, int, int]] = (255, 255, 255),
+        ring_w: float = 4,
+        dot: Optional[Tuple[int, int, int]] = None,
+    ) -> None:
+        if self.img is None:
+            return
+        try:
+            if ring is not None and ring_w > 0:
+                self.ellipse((x - ring_w, y - ring_w, x + size + ring_w, y + size + ring_w), fill=ring)
+            px = self.S(size)
+            av = None
+            if path and Path(path).exists():
+                try:
+                    raw = Image.open(path).convert("RGBA").resize((px, px), _lanczos())
+                    av = Image.new("RGB", (px, px), (255, 255, 255))
+                    av.paste(raw, (0, 0), raw)
+                except Exception:
+                    av = None
+            if av is None:
+                main_rgb, _, _ = get_vivid_theme(name)
+                av = Image.new("RGB", (px, px), main_rgb)
+                ad = ImageDraw.Draw(av)
+                ch = (strip_unsupported_chars(name) or "友")[0].upper()
+                f = self.r._get_font(max(8, int(px * 0.46)), True)
+                try:
+                    ad.text((px // 2, px // 2), ch, fill=(255, 255, 255), font=f, anchor="mm")
+                except Exception:
+                    ad.text((px // 4, px // 4), ch, fill=(255, 255, 255), font=f)
+            mask = Image.new("L", (px, px), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, px - 1, px - 1), fill=255)
+            self.img.paste(av, (self.S(x), self.S(y)), mask)
+            if dot is not None:
+                d = max(18, size * 0.26)
+                dx = x + size - d + 2
+                dy = y + size - d + 2
+                self.ellipse((dx - 3, dy - 3, dx + d + 3, dy + d + 3), fill=(255, 255, 255))
+                self.ellipse((dx, dy, dx + d, dy + d), fill=dot)
+        except Exception:
+            pass
+
+    # ---------------- 输出 ----------------
+    def save(self, path: Path) -> None:
+        if self.img is None:
+            return
+        out_w = max(1, int(round(self.w * OUT_SCALE)))
+        out_h = max(1, int(round(self.h * OUT_SCALE)))
+        try:
+            out = self.img.resize((out_w, out_h), _lanczos())
+        except Exception:
+            out = self.img
+        out.save(path, format="PNG")
