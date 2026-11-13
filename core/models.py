@@ -694,9 +694,8 @@ class ScheduleData:
 
         # 1. 动态校准课程周数与总周数 max_week
         semester_monday = self.get_semester_monday()
-        computed_max_week = 0
         for c in self.courses:
-            if c.specific_dates and not c.active_weeks:
+            if c.specific_dates:
                 w_nums: List[int] = []
                 for ds in c.specific_dates:
                     try:
@@ -710,14 +709,36 @@ class ScheduleData:
                     c.active_weeks = sorted(set(w_nums))
                     c.start_week = min(c.active_weeks)
                     c.end_week = max(c.active_weeks)
-            if c.active_weeks:
+            elif c.active_weeks:
                 c.start_week = min(c.active_weeks)
                 c.end_week = max(c.active_weeks)
-            if c.end_week > computed_max_week:
-                computed_max_week = c.end_week
 
+        # 修复旧版 .ics 因 UNTIL=SundayT235959Z 转换 UTC+8 溢出到下周一 07:59:59，
+        # 导致仅周一课程比周二至周日课程多出 1 周（如 18 周课表变成 19 周）的问题
+        if self.source_type == "ics" and len(self.courses) >= 2:
+            monday_courses = [c for c in self.courses if c.weekday == 1]
+            other_courses = [c for c in self.courses if c.weekday != 1]
+            if monday_courses and other_courses:
+                max_other_w = max(c.end_week for c in other_courses)
+                max_mon_w = max(c.end_week for c in monday_courses)
+                if max_other_w >= 4 and max_mon_w == max_other_w + 1:
+                    for mc in monday_courses:
+                        if mc.end_week == max_mon_w and len(mc.specific_dates) >= 2:
+                            mc.specific_dates = [
+                                ds
+                                for ds in mc.specific_dates
+                                if (((date.fromisoformat(ds) - semester_monday).days // 7) + 1)
+                                <= max_other_w
+                            ]
+                            mc.active_weeks = [w for w in mc.active_weeks if w <= max_other_w]
+                            if mc.active_weeks:
+                                mc.end_week = max(mc.active_weeks)
+                    if self.max_week == max_mon_w:
+                        self.max_week = max_other_w
+
+        computed_max_week = max((c.end_week for c in self.courses), default=0)
         if computed_max_week > 0:
-            if self.source_type == "ics" and self.max_week == 20 and computed_max_week != 20:
+            if self.source_type == "ics":
                 self.max_week = computed_max_week
             elif computed_max_week > self.max_week:
                 self.max_week = computed_max_week

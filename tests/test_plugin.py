@@ -641,6 +641,31 @@ class TestSchedulePlugin(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloaded_map[5].end_time, "12:30")
         self.assertEqual(reloaded_map[10].end_time, "18:20")
 
+        # 验证 18 周课表在 .ics 导出 UNTIL 为第18周周日 23:59:59Z 或第19周周一 00:00:00Z 时，不会溢出成 19 周
+        ics_18_weeks = "\r\n".join(
+            [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                "BEGIN:VEVENT",
+                "DTSTART;TZID=Asia/Shanghai:20260831T100000",
+                "DTEND;TZID=Asia/Shanghai:20260831T114000",
+                "RRULE:FREQ=WEEKLY;UNTIL=20270103T235959Z;INTERVAL=1;BYDAY=MO",
+                "SUMMARY:数据结构",
+                "DESCRIPTION:第3 - 4节\\n金明综合楼4101\\n王龙葛",
+                "END:VEVENT",
+                "BEGIN:VEVENT",
+                "DTSTART;TZID=Asia/Shanghai:20260901T080000",
+                "DTEND;TZID=Asia/Shanghai:20260901T094000",
+                "RRULE:FREQ=WEEKLY;UNTIL=20270103T235959Z;INTERVAL=1;BYDAY=TU",
+                "SUMMARY:大学体育（三）",
+                "DESCRIPTION:第1 - 2节\\n徐怡康",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ]
+        )
+        sched_18 = parse_ics_content(ics_18_weeks, tz_name="Asia/Shanghai")
+        self.assertEqual(sched_18.max_week, 18)
+
     def test_pil_rendering_code_paths_with_mock_pil(self) -> None:
         """验证当 Pillow (PIL) 启用时，三种渲染样式的所有绘图分支均无语法或逻辑错误"""
         import core.renderer as rmod

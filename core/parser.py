@@ -652,7 +652,15 @@ def _expand_rrule_dates(
     until_dt: Optional[datetime] = None
     if "UNTIL" in parts:
         try:
-            until_dt = _parse_ics_datetime(parts["UNTIL"], {}, target_tz_name)
+            raw_until = parts["UNTIL"].strip()
+            # 许多课表导出工具（如 WakeUp）会将本地周日 23:59:59 或下周一 00:00:00 直接拼接 Z，
+            # 若按 UTC+8 转换会溢出到下周一早上，导致 18 周的课表多出第 19 周。
+            if raw_until.upper().endswith(("T235959Z", "T000000Z")):
+                until_dt = _parse_ics_datetime(raw_until[:-1], {}, target_tz_name)
+            else:
+                until_dt = _parse_ics_datetime(raw_until, {}, target_tz_name)
+            if until_dt.hour == 0 and until_dt.minute == 0 and until_dt.second == 0:
+                until_dt = until_dt - timedelta(seconds=1)
         except Exception:
             until_dt = None
 
@@ -679,8 +687,10 @@ def _expand_rrule_dates(
                 d = week_monday + timedelta(days=wd - 1)
                 if d < base_date:
                     continue
-                if until_dt and d > until_dt.date():
-                    return dates
+                if until_dt:
+                    occ_dt = datetime.combine(d, start_dt.timetz())
+                    if occ_dt > until_dt:
+                        return dates
                 d_str = d.isoformat()
                 if d_str not in ex_set:
                     dates.append(d)
@@ -692,8 +702,10 @@ def _expand_rrule_dates(
         step_idx = 0
         while len(dates) < max_occurrences and step_idx < 200:
             d = cur_d + timedelta(days=step_idx * interval)
-            if until_dt and d > until_dt.date():
-                break
+            if until_dt:
+                occ_dt = datetime.combine(d, start_dt.timetz())
+                if occ_dt > until_dt:
+                    break
             if d.isoformat() not in ex_set:
                 dates.append(d)
             step_idx += 1
@@ -945,7 +957,9 @@ def parse_ics_content(
     earliest_date = min(all_dates) if all_dates else date.today()
     default_monday = earliest_date - timedelta(days=earliest_date.isoweekday() - 1)
     if anchored_mondays:
-        semester_monday = min(anchored_mondays)
+        from collections import Counter
+
+        semester_monday = Counter(anchored_mondays).most_common(1)[0][0]
     else:
         semester_monday = default_monday
 
