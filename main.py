@@ -164,7 +164,7 @@ except ImportError:
     "astrbot_plugin_schedule",
     "AstrBot Developer",
     "为AstrBot设计的课程表插件，支持.ics与WakeUp口令绑定、三种精美渲染样式、每日推送与课前提醒，深度适配QQ官方机器人",
-    "1.0.0",
+    "1.1.0",
     "https://github.com/astrbot/astrbot_plugin_schedule",
 )
 class SchedulePlugin(Star):

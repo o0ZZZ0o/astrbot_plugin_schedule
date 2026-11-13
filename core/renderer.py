@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import ssl
 import struct
 import subprocess
 import tempfile
 import time
 import urllib.request
-import ssl
 import zlib
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -57,7 +57,7 @@ FONT_SEARCH_PATHS = [
     "C:/Windows/Fonts/simhei.ttf",
 ]
 
-# Debian 官方及国内高速镜像站的文泉驿微米黑字体 deb 包（用于在极简无中文字体的 Debian 服务器上自动离线提取）
+# Debian 官方及国内高速镜像站的文泉驿微米黑字体 deb 包
 DEBIAN_FONT_DEB_MIRRORS = [
     "https://mirrors.aliyun.com/debian/pool/main/f/fonts-wqy-microhei/fonts-wqy-microhei_0.2.0-beta-3.1_all.deb",
     "https://mirrors.tuna.tsinghua.edu.cn/debian/pool/main/f/fonts-wqy-microhei/fonts-wqy-microhei_0.2.0-beta-3.1_all.deb",
@@ -78,7 +78,9 @@ VIVID_PALETTES: List[Tuple[Tuple[int, int, int], Tuple[int, int, int], Tuple[int
 ]
 
 
-def get_vivid_theme(course_name: str, index: int = 0) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], Tuple[int, int, int]]:
+def get_vivid_theme(
+    course_name: str, index: int = 0
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], Tuple[int, int, int]]:
     h = sum(ord(c) for c in (course_name or "课")) + index
     return VIVID_PALETTES[h % len(VIVID_PALETTES)]
 
@@ -114,16 +116,12 @@ def create_minimal_png(
 
 
 def strip_unsupported_chars(text: str) -> str:
-    """
-    移除标准中文字体不支持的彩色 Emoji 字符（避免在 Linux Pillow 下渲染为 □ 方框），
-    保留全部中英文、数字、全角/半角标点及常用几何符号。
-    """
+    """移除标准中文字体不支持的彩色 Emoji 字符（避免在 Linux Pillow 下渲染为 □ 方框）"""
     if not text:
         return ""
     cleaned: List[str] = []
     for ch in text:
         cp = ord(ch)
-        # 过滤 Unicode 补充平面 Emoji (U+1F000 - U+1FAFF) 及杂项符号区 Emoji + 变体选择符
         if 0x1F000 <= cp <= 0x1FAFF:
             continue
         if 0x2600 <= cp <= 0x27BF:
@@ -136,11 +134,11 @@ def strip_unsupported_chars(text: str) -> str:
 
 class ScheduleRenderer:
     """
-    专为手机 QQ 聊天窗口优化的高清竖版课程表渲染引擎：
-    - 黄金竖版比例 (720px 宽，点开前在手机聊天流中直接满宽清晰展示)
-    - 超大字号 + 粗细双字重层次，无需点开原图即可一眼看清时间、课程名、教室
-    - 4x 超采样抗锯齿圆形头像与徽章，彻底告别锯齿边缘
-    - 内置 Debian Linux 中文字体校验与自动修复机制，彻底杜绝中文乱码方框 (□□□)
+    专为手机 QQ 聊天窗口优化的高清自适应课程表渲染引擎：
+    - 动态多行换行 + 字号自适应缩放 + 卡片高度弹性伸缩，确保长课程名、长教室名、排行数据 100% 完整显示不截断
+    - 周课表完整展示周一至周日 7 天全部课程（包含周六、周日课程），并自动计算单元格最佳字号与行高
+    - 4x 超采样抗锯齿圆形头像与徽章
+    - 内置 Debian Linux 中文字体校验与自动修复机制
     """
 
     def __init__(self, storage: StorageManager, plugin_dir: Optional[Path] = None):
@@ -153,11 +151,6 @@ class ScheduleRenderer:
         self._init_cjk_font()
 
     def _font_supports_chinese(self, font_path: str, face_index: int = 0) -> bool:
-        """
-        严格校验字体文件是否真正包含中文字形：
-        若字体不含中文，'课' 与 '程' 均会回退到同一个 .notdef 方框字形，其位图完全相同；
-        只有真正包含中文的字体，'课' 与 '程' 才会渲染出不同的字形位图。
-        """
         if not HAS_PIL:
             return True
         try:
@@ -191,7 +184,6 @@ class ScheduleRenderer:
 
     def _init_cjk_font(self) -> None:
         """在 Debian / Linux / macOS / Windows 上按优先级快速定位或自动获取中文字体"""
-        # 1. 最优先检查插件自带 fonts/ 与数据目录 fonts/（命中即刻返回，耗时 <1ms）
         for folder in (self.plugin_dir / "fonts", self.storage.data_dir / "fonts"):
             if folder.exists():
                 for ext in ("*.ttc", "*.ttf", "*.otf"):
@@ -199,12 +191,10 @@ class ScheduleRenderer:
                         if self._try_use_font_candidate(str(p)):
                             return
 
-        # 2. 检查预设常见系统字体路径
         for p_str in FONT_SEARCH_PATHS:
             if self._try_use_font_candidate(p_str):
                 return
 
-        # 3. 在 Debian/Linux 上通过 fc-list :lang=zh 扫描
         try:
             proc = subprocess.run(
                 ["fc-list", ":lang=zh", "file"],
@@ -220,7 +210,6 @@ class ScheduleRenderer:
         except Exception:
             pass
 
-        # 4. 递归扫描 Linux 字体目录
         for sys_font_root in (
             "/usr/share/fonts",
             "/usr/local/share/fonts",
@@ -233,20 +222,17 @@ class ScheduleRenderer:
                         if self._try_use_font_candidate(str(fp)):
                             return
 
-        # 5. 若当前 Debian 服务器完全没有安装中文字体，自动从国内镜像拉取并解压 wqy-microhei.ttc
         downloaded = self._auto_provision_debian_cjk_font()
         if downloaded:
             self._try_use_font_candidate(downloaded)
 
     def _auto_provision_debian_cjk_font(self) -> Optional[str]:
-        """当 Debian Linux 服务器缺少中文字体时，自动从国内镜像拉取并解压 wqy-microhei.ttc"""
         target_dir = self.storage.data_dir / "fonts"
         target_dir.mkdir(parents=True, exist_ok=True)
         target_ttc = target_dir / "wqy-microhei.ttc"
         if target_ttc.exists() and target_ttc.stat().st_size > 100000:
             return str(target_ttc)
 
-        # 尝试从国内 Debian 镜像下载 fonts-wqy-microhei deb 包并用 dpkg-deb 解压
         for url in DEBIAN_FONT_DEB_MIRRORS:
             try:
                 ctx = ssl.create_default_context()
@@ -305,11 +291,58 @@ class ScheduleRenderer:
     def _text_size(self, draw: Any, text: str, font: Any) -> Tuple[int, int]:
         if not HAS_PIL or draw is None:
             return len(text) * 18, 26
+        clean = strip_unsupported_chars(text)
+        if not clean:
+            return 0, 0
         try:
-            bbox = draw.textbbox((0, 0), text, font=font)
+            bbox = draw.textbbox((0, 0), clean, font=font)
             return int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
         except Exception:
-            return len(text) * 18, 26
+            return len(clean) * 18, 26
+
+    def _fit_single_line_font(
+        self,
+        draw: Any,
+        text: str,
+        max_width: int,
+        start_size: int,
+        min_size: int = 14,
+        bold: bool = True,
+    ) -> Tuple[Any, int]:
+        """自动缩放单行文本字号，使其在不截断的情况下完全放入 max_width"""
+        clean = strip_unsupported_chars(text)
+        for sz in range(start_size, min_size - 1, -1):
+            f = self._get_font(sz, bold=bold)
+            w, _ = self._text_size(draw, clean, f)
+            if w <= max_width:
+                return f, sz
+        return self._get_font(min_size, bold=bold), min_size
+
+    def _wrap_text_full(
+        self, draw: Any, text: str, font: Any, max_width: int
+    ) -> List[str]:
+        """将文本按最大像素宽度完整拆分为多行，绝不丢弃或截断任何字符"""
+        clean = strip_unsupported_chars(text)
+        if not clean:
+            return []
+        lines: List[str] = []
+        current = ""
+        for ch in clean:
+            if ch == "\n":
+                if current:
+                    lines.append(current)
+                    current = ""
+                continue
+            test = current + ch
+            w, _ = self._text_size(draw, test, font)
+            if w <= max_width or not current:
+                current = test
+            else:
+                lines.append(current)
+                current = ch
+        if current:
+            lines.append(current)
+        return lines
 
     def _draw_text(
         self,
@@ -320,7 +353,6 @@ class ScheduleRenderer:
         font: Any,
         bold_stroke: bool = False,
     ) -> None:
-        """安全绘制文本（自动过滤不兼容 Emoji，并支持对单字重字体附加轻微描边加粗）"""
         if not HAS_PIL or draw is None:
             return
         clean = strip_unsupported_chars(text)
@@ -339,42 +371,6 @@ class ScheduleRenderer:
         except Exception:
             draw.text(xy, clean, fill=fill, font=font)
 
-    def _truncate_text(self, draw: Any, text: str, font: Any, max_width: int) -> str:
-        clean = strip_unsupported_chars(text)
-        if not clean:
-            return ""
-        w, _ = self._text_size(draw, clean, font)
-        if w <= max_width:
-            return clean
-        for i in range(len(clean), 0, -1):
-            sub = clean[:i] + "…"
-            sw, _ = self._text_size(draw, sub, font)
-            if sw <= max_width:
-                return sub
-        return clean[:1]
-
-    def _wrap_text(
-        self, draw: Any, text: str, font: Any, max_width: int, max_lines: int = 2
-    ) -> List[str]:
-        clean = strip_unsupported_chars(text)
-        if not clean:
-            return []
-        lines: List[str] = []
-        current = ""
-        for ch in clean:
-            test = current + ch
-            w, _ = self._text_size(draw, test, font)
-            if w <= max_width or not current:
-                current = test
-            else:
-                lines.append(current)
-                current = ch
-                if len(lines) >= max_lines:
-                    break
-        if current and len(lines) < max_lines:
-            lines.append(current)
-        return lines
-
     def _draw_avatar(
         self,
         canvas: Any,
@@ -387,7 +383,7 @@ class ScheduleRenderer:
         ring_width: int = 4,
         status_dot_color: Optional[Tuple[int, int, int]] = None,
     ) -> None:
-        """使用 4x 超采样绘制边缘丝滑抗锯齿的圆形 QQ 头像与状态圆点"""
+        """使用 4x 超采样绘制抗锯齿圆形 QQ 头像与状态圆点"""
         if not HAS_PIL:
             return
         try:
@@ -395,9 +391,7 @@ class ScheduleRenderer:
             total_size = size + ring_width * 2
             hi_total = total_size * scale
             hi_size = size * scale
-            hi_ring = ring_width * scale
 
-            # 1. 绘制超采样外环
             ring_layer = Image.new("RGBA", (hi_total, hi_total), (0, 0, 0, 0))
             ring_draw = ImageDraw.Draw(ring_layer)
             ring_draw.ellipse((0, 0, hi_total - 1, hi_total - 1), fill=(*ring_color, 255))
@@ -406,7 +400,6 @@ class ScheduleRenderer:
             )
             canvas.paste(smooth_ring, (x - ring_width, y - ring_width), smooth_ring)
 
-            # 2. 准备头像内容
             avatar_img = None
             if avatar_path and Path(avatar_path).exists():
                 try:
@@ -416,7 +409,6 @@ class ScheduleRenderer:
                     avatar_img = None
 
             if avatar_img is None:
-                # 兜底生成高颜值首字头像
                 primary_rgb, _, _ = get_vivid_theme(display_name)
                 avatar_img = Image.new("RGBA", (size, size), (*primary_rgb, 255))
                 av_draw = ImageDraw.Draw(avatar_img)
@@ -433,14 +425,12 @@ class ScheduleRenderer:
                     bold_stroke=True,
                 )
 
-            # 3. 4x 超采样圆形遮罩裁剪
             hi_mask = Image.new("L", (hi_size, hi_size), 0)
             hi_mask_draw = ImageDraw.Draw(hi_mask)
             hi_mask_draw.ellipse((0, 0, hi_size - 1, hi_size - 1), fill=255)
             smooth_mask = hi_mask.resize((size, size), Image.Resampling.LANCZOS)
             canvas.paste(avatar_img, (x, y), smooth_mask)
 
-            # 4. 可选状态指示圆点（同样 4x 超采样抗锯齿）
             if status_dot_color is not None:
                 dot_d = max(22, int(size * 0.26))
                 dot_pad = 4
@@ -467,6 +457,57 @@ class ScheduleRenderer:
         except Exception:
             pass
 
+    def _measure_course_card(
+        self, draw: Any, c: CourseInstance, w: int
+    ) -> Dict[str, Any]:
+        """预计算单张课程卡片的换行文本与所需的动态高度，确保文字 100% 完整展示"""
+        inner_w = w - 64  # 左右各留 32px 内边距
+
+        # 课程标题：若 34px 超过 2 行则自动微调到 30px，并完整保留所有换行
+        f_course = self._get_font(34, bold=True)
+        course_line_h = 44
+        course_lines = self._wrap_text_full(draw, c.course_name, f_course, inner_w)
+        if len(course_lines) > 2:
+            f_course = self._get_font(30, bold=True)
+            course_line_h = 39
+            course_lines = self._wrap_text_full(draw, c.course_name, f_course, inner_w)
+
+        # 教室与教师信息：合并或分行完整展示，绝不截断
+        f_meta = self._get_font(24, bold=True)
+        meta_line_h = 34
+        room_clean = strip_unsupported_chars(c.room) or "未指定"
+        teacher_clean = strip_unsupported_chars(c.teacher)
+        if teacher_clean and teacher_clean not in room_clean:
+            full_meta_str = f"教室 · {room_clean}    教师 · {teacher_clean}"
+        else:
+            full_meta_str = f"教室 · {room_clean}"
+
+        pill_inner_max_w = inner_w - 28
+        meta_lines = self._wrap_text_full(draw, full_meta_str, f_meta, pill_inner_max_w)
+        if not meta_lines:
+            meta_lines = ["教室 · 未指定"]
+
+        meta_box_h = 16 + len(meta_lines) * meta_line_h
+        if len(meta_lines) == 1:
+            mw, _ = self._text_size(draw, meta_lines[0], f_meta)
+            meta_box_w = min(inner_w, mw + 28)
+        else:
+            meta_box_w = inner_w
+
+        # 顶部时间行 (52px) + 间距 + 标题多行 + 间距 + 教室多行胶囊 + 底部留白
+        total_h = 74 + len(course_lines) * course_line_h + 14 + meta_box_h + 22
+        return {
+            "f_course": f_course,
+            "course_lines": course_lines,
+            "course_line_h": course_line_h,
+            "f_meta": f_meta,
+            "meta_lines": meta_lines,
+            "meta_line_h": meta_line_h,
+            "meta_box_w": meta_box_w,
+            "meta_box_h": meta_box_h,
+            "height": max(182, total_h),
+        }
+
     def _draw_course_card(
         self,
         draw: Any,
@@ -475,21 +516,21 @@ class ScheduleRenderer:
         x: int,
         y: int,
         w: int,
-        h: int,
-    ) -> None:
-        """绘制单张大字号、高对比度的课程卡片（点开前在手机缩略图中即可看清）"""
+        layout_info: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """根据预计算的自适应布局绘制单张课程卡片，返回卡片实际高度"""
+        if layout_info is None:
+            layout_info = self._measure_course_card(draw, c, w)
+
+        h = layout_info["height"]
         f_time = self._get_font(32, bold=True)
         f_node = self._get_font(21, bold=True)
-        f_status = self._get_font(22, bold=True)
-        f_course = self._get_font(36, bold=True)
-        f_meta = self._get_font(25, bold=True)
-        f_teacher = self._get_font(24, bold=False)
 
         vivid_main, vivid_bg, vivid_dark = get_vivid_theme(c.course_name, idx)
 
         if c.status == "ongoing":
-            card_bg = (236, 253, 245)       # 鲜明薄荷绿底
-            border_col = (16, 185, 129)     # 翠绿边框
+            card_bg = (236, 253, 245)
+            border_col = (16, 185, 129)
             bar_col = (5, 150, 105)
             pill_bg = (5, 150, 105)
             pill_fg = (255, 255, 255)
@@ -499,8 +540,8 @@ class ScheduleRenderer:
             room_fg = (4, 120, 87)
             status_label = f"进行中 · 剩{format_duration_cn(c.wait_or_remain_minutes)}"
         elif c.status == "next":
-            card_bg = (239, 246, 255)       # 鲜明晴空蓝底
-            border_col = (59, 130, 246)     # 亮蓝边框
+            card_bg = (239, 246, 255)
+            border_col = (59, 130, 246)
             bar_col = (37, 99, 235)
             pill_bg = (37, 99, 235)
             pill_fg = (255, 255, 255)
@@ -532,7 +573,6 @@ class ScheduleRenderer:
             room_fg = vivid_dark
             status_label = f"{c.start_time} 开课"
 
-        # 卡片圆角底板
         draw.rounded_rectangle(
             (x, y, x + w, y + h),
             radius=24,
@@ -540,14 +580,13 @@ class ScheduleRenderer:
             outline=border_col,
             width=3 if c.status in ("ongoing", "next") else 2,
         )
-        # 左侧鲜明色带
         draw.rounded_rectangle(
             (x, y + 14, x + 12, y + h - 14),
             radius=6,
             fill=bar_col,
         )
 
-        # 第一行：时间段 (32px Bold) + 节次胶囊 + 右上角状态胶囊
+        # 第一行：时间段 + 节次胶囊 + 右上角自适应状态胶囊
         time_str = f"{c.start_time} - {c.end_time}"
         self._draw_text(
             draw, (x + 32, y + 20), time_str, time_col, f_time, bold_stroke=True
@@ -556,7 +595,7 @@ class ScheduleRenderer:
 
         node_txt = c.node_range_str
         nw, _ = self._text_size(draw, node_txt, f_node)
-        nx = x + 32 + tw + 16
+        nx = x + 32 + tw + 14
         draw.rounded_rectangle(
             (nx, y + 23, nx + nw + 22, y + 55),
             radius=10,
@@ -566,7 +605,11 @@ class ScheduleRenderer:
             draw, (nx + 11, y + 27), node_txt, room_fg, f_node, bold_stroke=True
         )
 
-        # 右上角状态胶囊
+        # 状态胶囊自动匹配剩余宽度，确保不与左侧节次重叠
+        avail_status_w = max(90, (x + w - 24) - (nx + nw + 36))
+        f_status, _ = self._fit_single_line_font(
+            draw, status_label, avail_status_w - 28, start_size=22, min_size=15, bold=True
+        )
         sw, _ = self._text_size(draw, status_label, f_status)
         sx2 = x + w - 24
         sx1 = sx2 - sw - 28
@@ -579,39 +622,36 @@ class ScheduleRenderer:
             draw, (sx1 + 14, y + 26), status_label, pill_fg, f_status, bold_stroke=True
         )
 
-        # 第二行：超大课程名称 (36px Bold)
-        course_title = self._truncate_text(draw, c.course_name, f_course, w - 64)
-        self._draw_text(
-            draw, (x + 32, y + 72), course_title, title_col, f_course, bold_stroke=True
-        )
+        # 第二区：多行完整课程名称（不截断）
+        cy = y + 72
+        f_course = layout_info["f_course"]
+        for line in layout_info["course_lines"]:
+            self._draw_text(
+                draw, (x + 32, cy), line, title_col, f_course, bold_stroke=True
+            )
+            cy += layout_info["course_line_h"]
 
-        # 第三行：教室胶囊 (25px Bold) + 任课教师 (24px)
-        room_str = f"教室 · {c.room or '未指定'}"
-        room_str = self._truncate_text(draw, room_str, f_meta, 340)
-        rw, _ = self._text_size(draw, room_str, f_meta)
-        ry1 = y + 126
-        ry2 = y + 164
+        # 第三区：完整教室与教师胶囊（不截断）
+        cy += 10
+        meta_box_w = layout_info["meta_box_w"]
+        meta_box_h = layout_info["meta_box_h"]
         draw.rounded_rectangle(
-            (x + 32, ry1, x + 32 + rw + 26, ry2),
+            (x + 32, cy, x + 32 + meta_box_w, cy + meta_box_h),
             radius=12,
             fill=room_bg,
         )
-        self._draw_text(
-            draw, (x + 45, ry1 + 6), room_str, room_fg, f_meta, bold_stroke=True
-        )
-
-        if c.teacher:
-            t_str = self._truncate_text(draw, f"教师 · {c.teacher}", f_teacher, 220)
+        f_meta = layout_info["f_meta"]
+        m_ty = cy + 7
+        for m_line in layout_info["meta_lines"]:
             self._draw_text(
-                draw,
-                (x + 32 + rw + 44, ry1 + 7),
-                t_str,
-                (100, 116, 139),
-                f_teacher,
+                draw, (x + 46, m_ty), m_line, room_fg, f_meta, bold_stroke=True
             )
+            m_ty += layout_info["meta_line_h"]
+
+        return h
 
     # =========================================================================
-    # 样式一（A）：个人单日课表（竖版大字卡片风，适配手机未点开直接预览）
+    # 样式一（A）：个人单日课表（支持多行完整课程名与教室名，自适应高度）
     # =========================================================================
     def render_personal_daily(
         self,
@@ -634,8 +674,6 @@ class ScheduleRenderer:
             c for c in all_courses if c.status in ("ongoing", "next", "upcoming")
         ]
 
-        # 关键体验优化：如果用户触发 /查看课表 时今日课程已全部下课，仍然展示今日已上完的课程，
-        # 同时在下方附上「明日课程预览」，绝不让卡片变成空洞的白框！
         show_courses = upcoming_courses if (only_upcoming and upcoming_courses) else all_courses
         show_tomorrow = (
             tomorrow_preview
@@ -664,27 +702,37 @@ class ScheduleRenderer:
         pad_x = 28
         card_w = width - pad_x * 2
         hero_h = 268
-        course_card_h = 182
         course_gap = 18
 
-        # 计算总高度，确保至少为竖屏比例 (>= 860px)
+        # 预创建测量画布以精确计算每张课程卡片高度
+        dummy_img = Image.new("RGB", (32, 32))
+        dummy_draw = ImageDraw.Draw(dummy_img)
+
+        today_layouts = [
+            self._measure_course_card(dummy_draw, c, card_w) for c in show_courses
+        ]
+        tomorrow_layouts = (
+            [self._measure_course_card(dummy_draw, tc, card_w) for tc in show_tomorrow]
+            if show_tomorrow
+            else []
+        )
+
         content_h = 28 + hero_h + 24
         if only_upcoming and all_courses and not upcoming_courses:
-            content_h += 82  # “今日课程已全部结束”横幅
-        if show_courses:
-            content_h += len(show_courses) * (course_card_h + course_gap)
+            content_h += 82
+        if today_layouts:
+            content_h += sum(l["height"] + course_gap for l in today_layouts)
         else:
-            content_h += 240  # 当天无课海报卡
+            content_h += 220
 
-        if show_tomorrow:
-            content_h += 68 + len(show_tomorrow) * (course_card_h + course_gap)
+        if tomorrow_layouts:
+            content_h += 68 + sum(l["height"] + course_gap for l in tomorrow_layouts)
 
-        height = max(860, content_h + 70)
+        height = max(760, content_h + 64)
 
         img = Image.new("RGB", (width, height), (242, 244, 248))
         draw = ImageDraw.Draw(img)
 
-        f_hero_name = self._get_font(34, bold=True)
         f_hero_sub = self._get_font(22, bold=False)
         f_tag = self._get_font(24, bold=True)
         f_stat_val = self._get_font(34, bold=True)
@@ -694,22 +742,14 @@ class ScheduleRenderer:
         f_empty_sub = self._get_font(24, bold=False)
         f_footer = self._get_font(20, bold=False)
 
-        # 1. 顶部 Bento Hero 卡片（深邃皇家靛蓝卡片）
+        # 1. 顶部 Bento Hero 卡片
         hx1, hy1 = pad_x, 28
         hx2, hy2 = width - pad_x, 28 + hero_h
+        draw.rounded_rectangle((hx1, hy1, hx2, hy2), radius=28, fill=(30, 27, 75))
         draw.rounded_rectangle(
-            (hx1, hy1, hx2, hy2),
-            radius=28,
-            fill=(30, 27, 75),
-        )
-        # 顶部高亮装饰条
-        draw.rounded_rectangle(
-            (hx1 + 28, hy1, hx1 + 160, hy1 + 8),
-            radius=4,
-            fill=(99, 102, 241),
+            (hx1 + 28, hy1, hx1 + 160, hy1 + 8), radius=4, fill=(99, 102, 241)
         )
 
-        # 绘制丝滑抗锯齿圆形 QQ 头像
         self._draw_avatar(
             img,
             avatar_path,
@@ -721,30 +761,37 @@ class ScheduleRenderer:
             ring_width=4,
         )
 
-        # 群昵称与日期周次
-        name_txt = self._truncate_text(draw, display_name, f_hero_name, 330)
-        self._draw_text(
-            draw, (hx1 + 144, hy1 + 32), name_txt, (255, 255, 255), f_hero_name, bold_stroke=True
-        )
-        date_txt = f"{target_date.strftime('%m月%d日')} {weekday_str} · 第 {week_num} 周"
-        self._draw_text(
-            draw, (hx1 + 144, hy1 + 84), date_txt, (199, 210, 254), f_hero_sub
-        )
-
         # 右上角视图胶囊标签
         tw, _ = self._text_size(draw, title_prefix, f_tag)
         tx2 = hx2 - 28
         tx1 = tx2 - tw - 32
         draw.rounded_rectangle(
-            (tx1, hy1 + 32, tx2, hy1 + 80),
-            radius=24,
-            fill=(79, 70, 229),
+            (tx1, hy1 + 32, tx2, hy1 + 80), radius=24, fill=(79, 70, 229)
         )
         self._draw_text(
             draw, (tx1 + 16, hy1 + 42), title_prefix, (255, 255, 255), f_tag, bold_stroke=True
         )
 
-        # Hero 底部三栏 Bento 数据块
+        # 群昵称自适应字号，确保完整显示且不撞右上角胶囊
+        max_name_w = max(140, tx1 - (hx1 + 144) - 16)
+        f_hero_name, _ = self._fit_single_line_font(
+            draw, display_name, max_name_w, start_size=34, min_size=18, bold=True
+        )
+        self._draw_text(
+            draw,
+            (hx1 + 144, hy1 + 34),
+            display_name,
+            (255, 255, 255),
+            f_hero_name,
+            bold_stroke=True,
+        )
+
+        date_txt = f"{target_date.strftime('%m月%d日')} {weekday_str} · 第 {week_num} 周"
+        self._draw_text(
+            draw, (hx1 + 144, hy1 + 84), date_txt, (199, 210, 254), f_hero_sub
+        )
+
+        # 三栏 Bento 数据块
         bento_items = [
             ("今日课程", f"{len(all_courses)} 门"),
             ("总计节次", f"{total_nodes} 节"),
@@ -755,18 +802,18 @@ class ScheduleRenderer:
             bx = hx1 + 28 + b_idx * (bento_w + 12)
             by = hy1 + 148
             draw.rounded_rectangle(
-                (bx, by, bx + bento_w, by + 94),
-                radius=18,
-                fill=(49, 46, 129),
+                (bx, by, bx + bento_w, by + 94), radius=18, fill=(49, 46, 129)
             )
             self._draw_text(draw, (bx + 20, by + 14), b_lbl, (165, 180, 252), f_stat_lbl)
+            f_bv, _ = self._fit_single_line_font(
+                draw, b_val, bento_w - 32, start_size=34, min_size=22, bold=True
+            )
             self._draw_text(
-                draw, (bx + 20, by + 44), b_val, (255, 255, 255), f_stat_val, bold_stroke=True
+                draw, (bx + 20, by + 44), b_val, (255, 255, 255), f_bv, bold_stroke=True
             )
 
         y_cursor = hy2 + 24
 
-        # 如果今日有课但已全部结束，先绘制一条鲜明的绿色提示横幅
         if only_upcoming and all_courses and not upcoming_courses:
             draw.rounded_rectangle(
                 (pad_x, y_cursor, width - pad_x, y_cursor + 64),
@@ -787,15 +834,14 @@ class ScheduleRenderer:
             )
             y_cursor += 82
 
-        # 2. 绘制当日课程卡片列表或无课大字海报卡
         if show_courses:
-            for idx, c in enumerate(show_courses):
-                self._draw_course_card(
-                    draw, c, idx, x=pad_x, y=y_cursor, w=card_w, h=course_card_h
+            for idx, (c, l_info) in enumerate(zip(show_courses, today_layouts)):
+                drawn_h = self._draw_course_card(
+                    draw, c, idx, x=pad_x, y=y_cursor, w=card_w, layout_info=l_info
                 )
-                y_cursor += course_card_h + course_gap
+                y_cursor += drawn_h + course_gap
         else:
-            empty_box_h = 220 if show_tomorrow else (height - y_cursor - 84)
+            empty_box_h = 200 if show_tomorrow else max(220, height - y_cursor - 84)
             draw.rounded_rectangle(
                 (pad_x, y_cursor, width - pad_x, y_cursor + empty_box_h),
                 radius=26,
@@ -803,7 +849,6 @@ class ScheduleRenderer:
                 outline=(226, 232, 240),
                 width=2,
             )
-            # 装饰几何色块
             mid_y = y_cursor + empty_box_h // 2
             t1 = "当天无任何课程安排"
             t2 = "全天自由支配时间 · 尽情休息或约群友吧"
@@ -826,8 +871,7 @@ class ScheduleRenderer:
             )
             y_cursor += empty_box_h + 20
 
-        # 3. 明日课程预览（当今日无剩余课程时自动展示）
-        if show_tomorrow:
+        if show_tomorrow and tomorrow_layouts:
             self._draw_text(
                 draw,
                 (pad_x + 8, y_cursor + 12),
@@ -837,19 +881,18 @@ class ScheduleRenderer:
                 bold_stroke=True,
             )
             y_cursor += 58
-            for idx, tc in enumerate(show_tomorrow):
-                self._draw_course_card(
+            for idx, (tc, l_info) in enumerate(zip(show_tomorrow, tomorrow_layouts)):
+                drawn_h = self._draw_course_card(
                     draw,
                     tc,
                     idx + 3,
                     x=pad_x,
                     y=y_cursor,
                     w=card_w,
-                    h=course_card_h,
+                    layout_info=l_info,
                 )
-                y_cursor += course_card_h + course_gap
+                y_cursor += drawn_h + course_gap
 
-        # 底部简约时间签名
         footer_str = f"AstrBot 课程表  ·  {now.strftime('%Y-%m-%d %H:%M')}"
         fw, _ = self._text_size(draw, footer_str, f_footer)
         self._draw_text(
@@ -864,8 +907,69 @@ class ScheduleRenderer:
         return out_path
 
     # =========================================================================
-    # 样式一（B）：个人周课表网格（自适应列宽 + 大字鲜明色块）
+    # 样式一（B）：个人周课表网格（完整展示周一至周日 7 天 + 单元格字号与行高动态自适应）
     # =========================================================================
+    def _fit_weekly_cell_content(
+        self,
+        draw: Any,
+        c: CourseInstance,
+        inner_w: int,
+        avail_h: int,
+    ) -> Dict[str, Any]:
+        """
+        为周课表单元格自动选择最佳字号并完整换行（不截断任何课程名、教室与教师）：
+        依次尝试从大到小的字号组合，直到全部课程名 + 教室/教师完整放入单元格高度内。
+        """
+        room_clean = strip_unsupported_chars(c.room)
+        teacher_clean = strip_unsupported_chars(c.teacher)
+        if room_clean and teacher_clean and teacher_clean not in room_clean:
+            meta_str = f"@{room_clean} {teacher_clean}"
+        elif room_clean:
+            meta_str = f"@{room_clean}"
+        elif teacher_clean:
+            meta_str = teacher_clean
+        else:
+            meta_str = ""
+
+        size_candidates = [
+            (21, 17, 25, 21),
+            (19, 16, 23, 19),
+            (18, 15, 22, 18),
+            (16, 14, 19, 17),
+            (15, 13, 18, 16),
+            (14, 12, 16, 14),
+            (12, 11, 14, 13),
+        ]
+
+        best_plan: Optional[Dict[str, Any]] = None
+        for name_sz, meta_sz, name_lh, meta_lh in size_candidates:
+            f_name = self._get_font(name_sz, bold=True)
+            f_meta = self._get_font(meta_sz, bold=True)
+            name_lines = self._wrap_text_full(draw, c.course_name, f_name, inner_w)
+            meta_lines = (
+                self._wrap_text_full(draw, meta_str, f_meta, inner_w)
+                if meta_str
+                else []
+            )
+            needed_h = len(name_lines) * name_lh + (
+                (4 + len(meta_lines) * meta_lh) if meta_lines else 0
+            )
+            plan = {
+                "f_name": f_name,
+                "f_meta": f_meta,
+                "name_lines": name_lines,
+                "meta_lines": meta_lines,
+                "name_lh": name_lh,
+                "meta_lh": meta_lh,
+                "needed_h": needed_h,
+            }
+            best_plan = plan
+            if needed_h <= avail_h:
+                return plan
+
+        assert best_plan is not None
+        return best_plan
+
     def render_personal_weekly(
         self,
         profile: UserProfile,
@@ -892,42 +996,53 @@ class ScheduleRenderer:
 
         if not HAS_PIL:
             out_path.write_bytes(
-                create_minimal_png(920, 1080, (244, 246, 250), (49, 46, 129), 160)
+                create_minimal_png(1060, 1180, (244, 246, 250), (49, 46, 129), 160)
             )
             return out_path
 
-        # 自适应节次行数（至少展示 10 节，若有晚课则扩展）
-        max_nodes = 10
+        max_nodes = max(12, schedule.max_nodes)
         for day_list in week_courses.values():
             for c in day_list:
                 if c.end_node > max_nodes:
                     max_nodes = c.end_node
 
-        # 自适应天数：若周六、周日无课则展示 5 列（让每列宽 40%，字体更大更清晰），若有周末课则展示 7 列
-        has_weekend = bool(week_courses.get(6) or week_courses.get(7))
-        num_days = 7 if has_weekend else 5
-
-        width = 920
+        # 完整展示周一至周日 7 列（让周六、周日课程始终清晰可见）
+        num_days = 7
+        width = 1080
         pad_x = 24
         hero_h = 156
         col_header_h = 78
-        left_axis_w = 104
-        row_h = 92
+        left_axis_w = 96
         grid_w = width - pad_x * 2 - left_axis_w
         col_w = grid_w // num_days
+        inner_cell_w = col_w - 22
+
+        # 预测量所有课程块，若存在极长文本课程则自动增高单节行高 row_h，确保 100% 不溢出不截断
+        dummy_img = Image.new("RGB", (32, 32))
+        dummy_draw = ImageDraw.Draw(dummy_img)
+        row_h = 98
+        for day_list in week_courses.values():
+            for c in day_list:
+                span = max(1, c.end_node - c.start_node + 1)
+                avail_h = span * row_h - 26
+                plan = self._fit_weekly_cell_content(
+                    dummy_draw, c, inner_cell_w, avail_h
+                )
+                if plan["needed_h"] > avail_h:
+                    req_row_h = int((plan["needed_h"] + 30) / span) + 2
+                    if req_row_h > row_h:
+                        row_h = min(140, req_row_h)
+
         height = 24 + hero_h + 20 + col_header_h + max_nodes * row_h + 64
 
         img = Image.new("RGB", (width, height), (242, 244, 248))
         draw = ImageDraw.Draw(img)
 
-        f_hero_title = self._get_font(34, bold=True)
         f_hero_sub = self._get_font(22, bold=False)
-        f_col_wd = self._get_font(24, bold=True)
-        f_col_dt = self._get_font(18, bold=False)
+        f_col_wd = self._get_font(23, bold=True)
+        f_col_dt = self._get_font(17, bold=False)
         f_node_num = self._get_font(22, bold=True)
         f_node_tm = self._get_font(16, bold=False)
-        f_cell_name = self._get_font(22 if num_days == 5 else 19, bold=True)
-        f_cell_room = self._get_font(19 if num_days == 5 else 16, bold=True)
 
         # 顶部 Hero 卡片
         hx1, hy1 = pad_x, 24
@@ -949,14 +1064,15 @@ class ScheduleRenderer:
         total_wk_nodes = sum(c.step for c in all_wk_instances)
         total_wk_hours = round(sum(c.duration_minutes for c in all_wk_instances) / 60.0, 1)
 
-        head_str = self._truncate_text(
-            draw, f"{display_name} · {title_prefix}（第 {week_num} 周）", f_hero_title, width - 220
+        head_raw = f"{display_name} · {title_prefix}（第 {week_num} 周）"
+        f_hero_title, _ = self._fit_single_line_font(
+            draw, head_raw, (hx2 - hx1) - 180, start_size=34, min_size=20, bold=True
         )
         self._draw_text(
-            draw, (hx1 + 148, hy1 + 32), head_str, (255, 255, 255), f_hero_title, bold_stroke=True
+            draw, (hx1 + 148, hy1 + 32), head_raw, (255, 255, 255), f_hero_title, bold_stroke=True
         )
         sub_str = (
-            f"{monday.strftime('%m/%d')} - {sunday.strftime('%m/%d')}   ·   共 {len(all_wk_instances)} 门次 / {total_wk_nodes} 节 / {total_wk_hours} 小时"
+            f"{monday.strftime('%m/%d')} - {sunday.strftime('%m/%d')}（周一至周日）  ·  共 {len(all_wk_instances)} 门次 / {total_wk_nodes} 节 / {total_wk_hours} 小时"
         )
         self._draw_text(draw, (hx1 + 148, hy1 + 88), sub_str, (199, 210, 254), f_hero_sub)
 
@@ -971,7 +1087,6 @@ class ScheduleRenderer:
             width=2,
         )
 
-        # 表头背景
         draw.rounded_rectangle(
             (pad_x, grid_top, width - pad_x, grid_top + col_header_h),
             radius=24,
@@ -979,7 +1094,7 @@ class ScheduleRenderer:
         )
         self._draw_text(
             draw,
-            (pad_x + 26, grid_top + 24),
+            (pad_x + 24, grid_top + 24),
             "节次",
             (71, 85, 105),
             f_col_wd,
@@ -1000,7 +1115,7 @@ class ScheduleRenderer:
                     fill=(245, 247, 255),
                 )
                 draw.rounded_rectangle(
-                    (cx1 + 6, grid_top + 8, cx2 - 6, grid_top + col_header_h - 8),
+                    (cx1 + 5, grid_top + 8, cx2 - 5, grid_top + col_header_h - 8),
                     radius=16,
                     fill=(79, 70, 229),
                 )
@@ -1023,13 +1138,11 @@ class ScheduleRenderer:
                 draw, (cx1 + (col_w - w2) // 2, grid_top + 46), dt_txt, fg2, f_col_dt
             )
 
-        # 水平与垂直分隔线 + 左侧节次时间
         slot_map = {s.node: s for s in schedule.time_slots}
         default_map = {s["node"]: s for s in DEFAULT_TIME_SLOTS}
 
         for node in range(1, max_nodes + 1):
             ry1 = body_top + (node - 1) * row_h
-            ry2 = ry1 + row_h
             draw.line((pad_x, ry1, width - pad_x, ry1), fill=(226, 232, 240), width=1)
 
             slot = slot_map.get(node)
@@ -1069,25 +1182,25 @@ class ScheduleRenderer:
             cx = pad_x + left_axis_w + d_idx * col_w
             draw.line((cx, grid_top, cx, grid_bottom), fill=(226, 232, 240), width=1)
 
-        # 绘制课程鲜明色块
+        # 绘制周一至周日每一天的课程色块（自适应字号，完整显示全部文字）
         for wd, day_courses in week_courses.items():
             d_idx = wd - 1
             if not (0 <= d_idx < num_days):
                 continue
-            cx1 = pad_x + left_axis_w + d_idx * col_w + 5
-            cx2 = cx1 + col_w - 10
+            cx1 = pad_x + left_axis_w + d_idx * col_w + 4
+            cx2 = cx1 + col_w - 8
 
             for idx, c in enumerate(day_courses):
                 s_node = max(1, min(max_nodes, c.start_node))
                 e_node = max(s_node, min(max_nodes, c.end_node))
-                cy1 = body_top + (s_node - 1) * row_h + 5
-                cy2 = body_top + e_node * row_h - 5
+                cy1 = body_top + (s_node - 1) * row_h + 4
+                cy2 = body_top + e_node * row_h - 4
 
                 v_main, v_bg, v_dark = get_vivid_theme(c.course_name, idx)
 
                 draw.rounded_rectangle(
                     (cx1, cy1, cx2, cy2),
-                    radius=14,
+                    radius=12,
                     fill=v_bg,
                     outline=v_main,
                     width=2,
@@ -1098,28 +1211,36 @@ class ScheduleRenderer:
                     fill=v_main,
                 )
 
-                inner_w = (cx2 - cx1) - 16
-                c_lines = self._wrap_text(draw, c.course_name, f_cell_name, inner_w, max_lines=3)
-                ty = cy1 + 14
-                for ln in c_lines:
-                    if ty + 24 > cy2 - 6:
-                        break
-                    self._draw_text(
-                        draw, (cx1 + 8, ty), ln, v_dark, f_cell_name, bold_stroke=True
-                    )
-                    ty += 26
+                cell_inner_w = (cx2 - cx1) - 14
+                cell_avail_h = (cy2 - cy1) - 18
+                plan = self._fit_weekly_cell_content(
+                    draw, c, cell_inner_w, cell_avail_h
+                )
 
-                if c.room and ty + 20 <= cy2 - 4:
-                    r_lines = self._wrap_text(
-                        draw, f"@{c.room}", f_cell_room, inner_w, max_lines=2
+                ty = cy1 + 12
+                for ln in plan["name_lines"]:
+                    self._draw_text(
+                        draw,
+                        (cx1 + 7, ty),
+                        ln,
+                        v_dark,
+                        plan["f_name"],
+                        bold_stroke=True,
                     )
-                    for rln in r_lines:
-                        if ty + 20 > cy2 - 4:
-                            break
+                    ty += plan["name_lh"]
+
+                if plan["meta_lines"]:
+                    ty += 3
+                    for rln in plan["meta_lines"]:
                         self._draw_text(
-                            draw, (cx1 + 8, ty + 4), rln, v_main, f_cell_room, bold_stroke=True
+                            draw,
+                            (cx1 + 7, ty),
+                            rln,
+                            v_main,
+                            plan["f_meta"],
+                            bold_stroke=True,
                         )
-                        ty += 22
+                        ty += plan["meta_lh"]
 
         footer_str = f"AstrBot 课程表  ·  第 {week_num} 周  ·  {now.strftime('%Y-%m-%d %H:%M')}"
         fw, _ = self._text_size(draw, footer_str, f_col_dt)
@@ -1131,7 +1252,7 @@ class ScheduleRenderer:
         return out_path
 
     # =========================================================================
-    # 样式二：群友课表总览（鲜明社交状态看板，720px 竖版大字卡片）
+    # 样式二：群友课表总览（动态多行展开，完整显示长课程名与全部明日课程）
     # =========================================================================
     def render_group_overview(
         self,
@@ -1157,6 +1278,20 @@ class ScheduleRenderer:
             )
             return out_path
 
+        width = 720
+        pad_x = 28
+        card_w = width - pad_x * 2
+        hero_h = 256
+        card_gap = 20
+
+        dummy_img = Image.new("RGB", (32, 32))
+        dummy_draw = ImageDraw.Draw(dummy_img)
+        f_main_line = self._get_font(26, bold=True)
+        f_sub_line = self._get_font(22, bold=False)
+
+        inner_box_w = (width - pad_x - 24) - (pad_x + 140)
+        inner_text_max_w = inner_box_w - 32
+
         rows: List[Dict[str, Any]] = []
         ongoing_count = 0
         free_count = 0
@@ -1171,42 +1306,100 @@ class ScheduleRenderer:
                 if day_courses:
                     has_class_tomorrow_count += 1
                     sort_rank = (0, day_courses[0].start_time, -len(day_courses))
+                    accent_col = (37, 99, 235)
+                    box_bg = (239, 246, 255)
+                    box_fg = (30, 58, 138)
+                    total_nodes = sum(c.step for c in day_courses)
+                    early_str = " · 早八" if day_courses[0].start_time <= "08:30" else ""
+                    pill_txt = f"明日 {len(day_courses)} 门 ({total_nodes}节){early_str}"
+
+                    main_lines: List[str] = []
+                    for c in day_courses:
+                        loc = f" @{c.room}" if c.room else ""
+                        item_str = f"{c.start_time}-{c.end_time} {c.course_name}{loc}"
+                        main_lines.extend(
+                            self._wrap_text_full(dummy_draw, item_str, f_main_line, inner_text_max_w)
+                        )
+                    sub_lines = [
+                        f"全天共计 {total_nodes} 节 · {format_duration_cn(sum(c.duration_minutes for c in day_courses))}"
+                    ]
                 else:
                     free_count += 1
                     sort_rank = (1, "99:99", 0)
+                    accent_col = (16, 185, 129)
+                    box_bg = (236, 253, 245)
+                    box_fg = (6, 95, 70)
+                    pill_txt = "明天全天无课"
+                    main_lines = ["明日无任何课程安排"]
+                    sub_lines = ["全天自由活动 · 可放心约饭或游戏"]
             else:
                 if ongoing_c:
                     ongoing_count += 1
                     sort_rank = (0, ongoing_c.end_time, 0)
+                    accent_col = (234, 88, 12)
+                    box_bg = (255, 247, 237)
+                    box_fg = (154, 52, 18)
+                    pill_txt = f"上课中 · 剩{format_duration_cn(ongoing_c.wait_or_remain_minutes)}"
+                    loc = f" @{ongoing_c.room}" if ongoing_c.room else ""
+                    main_raw = f"正在上：{ongoing_c.course_name}{loc}"
+                    if next_c:
+                        sub_raw = f"{ongoing_c.start_time}-{ongoing_c.end_time} | 下一节 {next_c.start_time} {next_c.course_name}"
+                    else:
+                        sub_raw = f"{ongoing_c.start_time}-{ongoing_c.end_time}（上完这节今日就下课啦）"
                 elif next_c:
                     sort_rank = (1, next_c.start_time, 0)
+                    accent_col = (37, 99, 235)
+                    box_bg = (239, 246, 255)
+                    box_fg = (30, 64, 175)
+                    pill_txt = f"下一节 · {format_duration_cn(next_c.wait_or_remain_minutes)}后"
+                    loc = f" @{next_c.room}" if next_c.room else ""
+                    main_raw = f"下一节：{next_c.course_name}{loc}"
+                    sub_raw = f"上课时间 {next_c.start_time} - {next_c.end_time} ({next_c.node_range_str})"
                 else:
                     free_count += 1
                     sort_rank = (2, "99:99", 0)
+                    accent_col = (16, 185, 129)
+                    box_bg = (236, 253, 245)
+                    box_fg = (6, 95, 70)
+                    pill_txt = "空闲 · 随时可约"
+                    if day_courses:
+                        main_raw = f"今日 {len(day_courses)} 门课已全部上完"
+                        sub_raw = f"最后下课时间 {day_courses[-1].end_time} · 当前完全空闲"
+                    else:
+                        main_raw = "今日全天无课"
+                        sub_raw = "当前完全空闲 · 随时可以约饭或开黑"
+
+                main_lines = self._wrap_text_full(
+                    dummy_draw, main_raw, f_main_line, inner_text_max_w
+                )
+                sub_lines = self._wrap_text_full(
+                    dummy_draw, sub_raw, f_sub_line, inner_text_max_w
+                )
+
+            inner_box_h = 24 + len(main_lines) * 35 + 8 + len(sub_lines) * 30
+            card_h = max(210, 78 + inner_box_h + 22)
 
             rows.append(
                 {
                     "profile": prof,
                     "display_name": prof.get_display_name(group_id),
                     "avatar_path": av_path,
-                    "day_courses": day_courses,
-                    "ongoing": ongoing_c,
-                    "next": next_c,
+                    "accent_col": accent_col,
+                    "box_bg": box_bg,
+                    "box_fg": box_fg,
+                    "pill_txt": pill_txt,
+                    "main_lines": main_lines,
+                    "sub_lines": sub_lines,
+                    "inner_box_h": inner_box_h,
+                    "card_h": card_h,
                     "sort_rank": sort_rank,
                 }
             )
 
         rows.sort(key=lambda r: r["sort_rank"])
 
-        width = 720
-        pad_x = 28
-        card_w = width - pad_x * 2
-        hero_h = 256
-        member_card_h = 216
-        card_gap = 20
-
-        content_h = 28 + hero_h + 24 + len(rows) * (member_card_h + card_gap)
-        height = max(860, content_h + 68)
+        content_h = 28 + hero_h + 24 + sum(r["card_h"] + card_gap for r in rows)
+        height = max(760, content_h + 64)
 
         img = Image.new("RGB", (width, height), (240, 246, 246))
         draw = ImageDraw.Draw(img)
@@ -1215,13 +1408,9 @@ class ScheduleRenderer:
         f_hero_sub = self._get_font(22, bold=False)
         f_stat_val = self._get_font(36, bold=True)
         f_stat_lbl = self._get_font(20, bold=False)
-        f_name = self._get_font(32, bold=True)
-        f_pill = self._get_font(22, bold=True)
-        f_main_line = self._get_font(27, bold=True)
-        f_sub_line = self._get_font(23, bold=False)
         f_footer = self._get_font(20, bold=False)
 
-        # 1. 顶部社交状态看板 Hero 卡片（深青墨绿 + 亮青色块）
+        # 顶部 Hero 卡片
         hx1, hy1 = pad_x, 28
         hx2, hy2 = width - pad_x, 28 + hero_h
         draw.rounded_rectangle((hx1, hy1, hx2, hy2), radius=28, fill=(17, 36, 42))
@@ -1263,46 +1452,17 @@ class ScheduleRenderer:
 
         y_cursor = hy2 + 24
 
-        # 2. 每位群友的大字状态卡片
         for row in rows:
             dname = row["display_name"]
             av_path = row["avatar_path"]
-            day_courses: List[CourseInstance] = row["day_courses"]
-            ongoing_c: Optional[CourseInstance] = row["ongoing"]
-            next_c: Optional[CourseInstance] = row["next"]
+            accent_col = row["accent_col"]
+            box_bg = row["box_bg"]
+            box_fg = row["box_fg"]
+            pill_txt = row["pill_txt"]
+            card_h = row["card_h"]
 
             c_top = y_cursor
-            c_bot = y_cursor + member_card_h
-
-            if is_tomorrow:
-                if day_courses:
-                    accent_col = (37, 99, 235)
-                    box_bg = (239, 246, 255)
-                    box_fg = (30, 58, 138)
-                    total_nodes = sum(c.step for c in day_courses)
-                    early_str = " · 早八" if day_courses[0].start_time <= "08:30" else ""
-                    pill_txt = f"明日 {len(day_courses)} 门 ({total_nodes}节){early_str}"
-                else:
-                    accent_col = (16, 185, 129)
-                    box_bg = (236, 253, 245)
-                    box_fg = (6, 95, 70)
-                    pill_txt = "明天全天无课"
-            else:
-                if ongoing_c:
-                    accent_col = (234, 88, 12)   # 鲜明珊瑚橙：正在上课
-                    box_bg = (255, 247, 237)
-                    box_fg = (154, 52, 18)
-                    pill_txt = f"上课中 · 剩{format_duration_cn(ongoing_c.wait_or_remain_minutes)}"
-                elif next_c:
-                    accent_col = (37, 99, 235)   # 电光蓝：等待下一节
-                    box_bg = (239, 246, 255)
-                    box_fg = (30, 64, 175)
-                    pill_txt = f"下一节 · {format_duration_cn(next_c.wait_or_remain_minutes)}后"
-                else:
-                    accent_col = (16, 185, 129)  # 翠绿：空闲可约
-                    box_bg = (236, 253, 245)
-                    box_fg = (6, 95, 70)
-                    pill_txt = "空闲 · 随时可约"
+            c_bot = y_cursor + card_h
 
             draw.rounded_rectangle(
                 (pad_x, c_top, width - pad_x, c_bot),
@@ -1317,7 +1477,6 @@ class ScheduleRenderer:
                 fill=accent_col,
             )
 
-            # 左侧 96px 抗锯齿圆形 QQ 头像 + 状态圆点
             self._draw_avatar(
                 img,
                 av_path,
@@ -1330,12 +1489,10 @@ class ScheduleRenderer:
                 status_dot_color=accent_col,
             )
 
-            # 第一行：群昵称 (32px Bold) + 右上角鲜明实心状态胶囊
-            name_str = self._truncate_text(draw, dname, f_name, 260)
-            self._draw_text(
-                draw, (pad_x + 140, c_top + 24), name_str, (15, 23, 42), f_name, bold_stroke=True
+            # 右上角状态胶囊
+            f_pill, _ = self._fit_single_line_font(
+                draw, pill_txt, 250, start_size=22, min_size=16, bold=True
             )
-
             pw, _ = self._text_size(draw, pill_txt, f_pill)
             px2 = width - pad_x - 24
             px1 = px2 - pw - 28
@@ -1348,69 +1505,41 @@ class ScheduleRenderer:
                 draw, (px1 + 14, c_top + 29), pill_txt, (255, 255, 255), f_pill, bold_stroke=True
             )
 
-            # 下方课程详情高对比度内嵌框
+            # 群昵称自适应字号，确保完整显示
+            avail_name_w = max(120, px1 - (pad_x + 140) - 14)
+            f_name, _ = self._fit_single_line_font(
+                draw, dname, avail_name_w, start_size=32, min_size=18, bold=True
+            )
+            self._draw_text(
+                draw, (pad_x + 140, c_top + 24), dname, (15, 23, 42), f_name, bold_stroke=True
+            )
+
+            # 多行自适应内嵌详情框
             ib_x1 = pad_x + 140
             ib_x2 = width - pad_x - 24
             ib_y1 = c_top + 78
-            ib_y2 = c_bot - 20
+            ib_y2 = ib_y1 + row["inner_box_h"]
             draw.rounded_rectangle(
                 (ib_x1, ib_y1, ib_x2, ib_y2),
                 radius=18,
                 fill=box_bg,
             )
-            inner_max_w = (ib_x2 - ib_x1) - 32
 
-            if is_tomorrow:
-                if not day_courses:
-                    main_txt = "明日无任何课程安排"
-                    sub_txt = "全天自由活动 · 可放心约饭或游戏"
-                else:
-                    first_c = day_courses[0]
-                    loc = f" @{first_c.room}" if first_c.room else ""
-                    main_txt = f"{first_c.start_time}-{first_c.end_time}  {first_c.course_name}{loc}"
-                    if len(day_courses) > 1:
-                        sec_c = day_courses[1]
-                        more = f" 等{len(day_courses)}门课" if len(day_courses) > 2 else ""
-                        sub_txt = f"后续：{sec_c.start_time} {sec_c.course_name}{more}"
-                    else:
-                        sub_txt = f"明天仅此 1 门课（共 {first_c.step} 节）"
-            else:
-                if ongoing_c:
-                    loc = f" @{ongoing_c.room}" if ongoing_c.room else ""
-                    main_txt = f"正在上：{ongoing_c.course_name}{loc}"
-                    if next_c:
-                        sub_txt = f"{ongoing_c.start_time}-{ongoing_c.end_time}  |  下一节 {next_c.start_time} {next_c.course_name}"
-                    else:
-                        sub_txt = f"{ongoing_c.start_time}-{ongoing_c.end_time}（上完这节今日就下课啦）"
-                elif next_c:
-                    loc = f" @{next_c.room}" if next_c.room else ""
-                    main_txt = f"下一节：{next_c.course_name}{loc}"
-                    sub_txt = f"上课时间 {next_c.start_time} - {next_c.end_time} ({next_c.node_range_str})"
-                else:
-                    if day_courses:
-                        main_txt = f"今日 {len(day_courses)} 门课已全部上完"
-                        sub_txt = f"最后下课时间 {day_courses[-1].end_time} · 当前完全空闲"
-                    else:
-                        main_txt = "今日全天无课"
-                        sub_txt = "当前完全空闲 · 随时可以约饭或开黑"
+            ty = ib_y1 + 14
+            for mln in row["main_lines"]:
+                self._draw_text(
+                    draw, (ib_x1 + 16, ty), mln, box_fg, f_main_line, bold_stroke=True
+                )
+                ty += 35
 
-            self._draw_text(
-                draw,
-                (ib_x1 + 16, ib_y1 + 16),
-                self._truncate_text(draw, main_txt, f_main_line, inner_max_w),
-                box_fg,
-                f_main_line,
-                bold_stroke=True,
-            )
-            self._draw_text(
-                draw,
-                (ib_x1 + 16, ib_y1 + 62),
-                self._truncate_text(draw, sub_txt, f_sub_line, inner_max_w),
-                (71, 85, 105),
-                f_sub_line,
-            )
+            ty += 4
+            for sln in row["sub_lines"]:
+                self._draw_text(
+                    draw, (ib_x1 + 16, ty), sln, (71, 85, 105), f_sub_line
+                )
+                ty += 30
 
-            y_cursor += member_card_h + card_gap
+            y_cursor += card_h + card_gap
 
         footer_str = f"AstrBot 课程表  ·  {now.strftime('%Y-%m-%d %H:%M')}"
         fw, _ = self._text_size(draw, footer_str, f_footer)
@@ -1422,7 +1551,7 @@ class ScheduleRenderer:
         return out_path
 
     # =========================================================================
-    # 样式三：本周上课排行榜（黑金荣耀榜，720px 竖版大字卡片）
+    # 样式三：本周上课排行榜（黑金荣耀榜，自适应字号完整显示“早八 X 次”等全部信息）
     # =========================================================================
     def render_weekly_ranking(
         self,
@@ -1482,27 +1611,24 @@ class ScheduleRenderer:
         pad_x = 28
         card_w = width - pad_x * 2
         hero_h = 256
-        row_h = 196
+        row_h = 204
         row_gap = 20
 
         content_h = 28 + hero_h + 24 + len(ranking_rows) * (row_h + row_gap)
-        height = max(860, content_h + 68)
+        height = max(760, content_h + 64)
 
         img = Image.new("RGB", (width, height), (246, 244, 240))
         draw = ImageDraw.Draw(img)
 
         f_hero_title = self._get_font(38, bold=True)
         f_hero_sub = self._get_font(22, bold=False)
-        f_stat_val = self._get_font(36, bold=True)
         f_stat_lbl = self._get_font(20, bold=False)
         f_rank_num = self._get_font(28, bold=True)
-        f_name = self._get_font(32, bold=True)
         f_tag = self._get_font(21, bold=True)
         f_hours = self._get_font(34, bold=True)
-        f_nodes = self._get_font(24, bold=True)
         f_footer = self._get_font(20, bold=False)
 
-        # 1. 顶部黑金荣耀 Hero 卡片
+        # 顶部黑金荣耀 Hero 卡片
         hx1, hy1 = pad_x, 28
         hx2, hy2 = width - pad_x, 28 + hero_h
         draw.rounded_rectangle((hx1, hy1, hx2, hy2), radius=28, fill=(24, 24, 27))
@@ -1531,32 +1657,34 @@ class ScheduleRenderer:
                 (bx, by, bx + bento_w, by + 94), radius=18, fill=(39, 39, 42)
             )
             self._draw_text(draw, (bx + 18, by + 14), s_lbl, (212, 212, 216), f_stat_lbl)
+            f_sv, _ = self._fit_single_line_font(
+                draw, s_val, bento_w - 28, start_size=34, min_size=22, bold=True
+            )
             self._draw_text(
-                draw, (bx + 18, by + 44), s_val, s_col, f_stat_val, bold_stroke=True
+                draw, (bx + 18, by + 44), s_val, s_col, f_sv, bold_stroke=True
             )
 
         y_cursor = hy2 + 24
 
-        # 2. 排行榜成员卡片
         for idx, r in enumerate(ranking_rows):
             rank = idx + 1
             c_top = y_cursor
             c_bot = y_cursor + row_h
 
             if rank == 1:
-                medal_col = (245, 158, 11)     # 冠军金
+                medal_col = (245, 158, 11)
                 tag_bg = (254, 243, 199)
                 tag_fg = (180, 83, 9)
                 rank_str = "NO.1"
                 title_tag = "卷王之王" if r["total_mins"] > 0 else "清闲仙人"
             elif rank == 2:
-                medal_col = (100, 116, 139)    # 亚军银
+                medal_col = (100, 116, 139)
                 tag_bg = (241, 245, 249)
                 tag_fg = (51, 65, 85)
                 rank_str = "NO.2"
                 title_tag = "早八战神" if r["early_count"] >= 2 else "勤学标兵"
             elif rank == 3:
-                medal_col = (217, 119, 6)      # 季军铜
+                medal_col = (217, 119, 6)
                 tag_bg = (255, 237, 213)
                 tag_fg = (154, 52, 18)
                 rank_str = "NO.3"
@@ -1576,7 +1704,6 @@ class ScheduleRenderer:
                 width=3 if rank == 1 else 2,
             )
 
-            # 左侧头像 + 顶部排名角标
             self._draw_avatar(
                 img,
                 r["avatar_path"],
@@ -1588,10 +1715,9 @@ class ScheduleRenderer:
                 ring_width=4,
             )
 
-            # 头像下方排名胶囊
             rw, _ = self._text_size(draw, rank_str, f_rank_num)
             rx1 = pad_x + 26 + (96 - (rw + 28)) // 2
-            ry1 = c_top + 132
+            ry1 = c_top + 134
             draw.rounded_rectangle(
                 (rx1, ry1, rx1 + rw + 28, ry1 + 42),
                 radius=14,
@@ -1601,12 +1727,7 @@ class ScheduleRenderer:
                 draw, (rx1 + 14, ry1 + 6), rank_str, (255, 255, 255), f_rank_num, bold_stroke=True
             )
 
-            # 右侧第一行：群昵称 (32px Bold) + 称号胶囊
-            dname = self._truncate_text(draw, r["display_name"], f_name, 300)
-            self._draw_text(
-                draw, (pad_x + 148, c_top + 24), dname, (15, 23, 42), f_name, bold_stroke=True
-            )
-
+            # 右上角称号胶囊
             tw, _ = self._text_size(draw, title_tag, f_tag)
             tx2 = width - pad_x - 24
             tx1 = tx2 - tw - 28
@@ -1619,39 +1740,68 @@ class ScheduleRenderer:
                 draw, (tx1 + 14, c_top + 31), title_tag, tag_fg, f_tag, bold_stroke=True
             )
 
-            # 右侧第二行：大字时长与节数
+            # 群昵称自适应字号，确保完整显示
+            avail_name_w = max(120, tx1 - (pad_x + 148) - 14)
+            f_name, _ = self._fit_single_line_font(
+                draw, r["display_name"], avail_name_w, start_size=32, min_size=18, bold=True
+            )
+            self._draw_text(
+                draw,
+                (pad_x + 148, c_top + 24),
+                r["display_name"],
+                (15, 23, 42),
+                f_name,
+                bold_stroke=True,
+            )
+
+            # 第二行：大字时长 + 自适应字号的节数与早八统计（绝不截断“早八 X 次”）
             hours_str = f"{r['total_hours']} 小时"
             self._draw_text(
-                draw, (pad_x + 148, c_top + 80), hours_str, medal_col if rank == 1 else (15, 23, 42), f_hours, bold_stroke=True
+                draw,
+                (pad_x + 148, c_top + 80),
+                hours_str,
+                medal_col if rank == 1 else (15, 23, 42),
+                f_hours,
+                bold_stroke=True,
             )
             hw, _ = self._text_size(draw, hours_str, f_hours)
 
             nodes_str = f"共 {r['total_nodes']} 节 · {r['course_count']} 门课 · 早八 {r['early_count']} 次"
-            nodes_str = self._truncate_text(draw, nodes_str, f_nodes, 480 - hw)
+            avail_nodes_w = (width - pad_x - 24) - (pad_x + 148 + hw + 16)
+            f_nodes_fit, fitted_sz = self._fit_single_line_font(
+                draw, nodes_str, avail_nodes_w, start_size=23, min_size=15, bold=True
+            )
+            y_offset = 88 + max(0, (23 - fitted_sz) // 2)
             self._draw_text(
                 draw,
-                (pad_x + 148 + hw + 18, c_top + 88),
+                (pad_x + 148 + hw + 16, c_top + y_offset),
                 nodes_str,
                 (100, 116, 139),
-                f_nodes,
+                f_nodes_fit,
                 bold_stroke=True,
             )
 
-            # 右侧第三行：加粗鲜明进度条
+            # 第三行：加粗鲜明进度条
             bar_x1 = pad_x + 148
             bar_x2 = width - pad_x - 24
-            bar_y = c_top + 144
+            bar_y = c_top + 148
             draw.rounded_rectangle(
                 (bar_x1, bar_y, bar_x2, bar_y + 22),
                 radius=11,
                 fill=(241, 245, 249),
             )
-            ratio = min(1.0, max(0.06, r["total_mins"] / max_mins)) if r["total_mins"] > 0 else 0.04
+            ratio = (
+                min(1.0, max(0.06, r["total_mins"] / max_mins))
+                if r["total_mins"] > 0
+                else 0.04
+            )
             fill_w = max(24, int((bar_x2 - bar_x1) * ratio))
             draw.rounded_rectangle(
                 (bar_x1, bar_y, bar_x1 + fill_w, bar_y + 22),
                 radius=11,
-                fill=medal_col if rank == 1 else ((37, 99, 235) if rank == 2 else (13, 148, 136)),
+                fill=medal_col
+                if rank == 1
+                else ((37, 99, 235) if rank == 2 else (13, 148, 136)),
             )
 
             y_cursor += row_h + row_gap

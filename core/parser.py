@@ -222,6 +222,8 @@ def parse_wakeup_raw_data(raw_data: str, tz_name: str = "Asia/Shanghai") -> Sche
             color = pick_course_color(course_name, idx)
 
         day = int(d.get("day", 1))
+        if day == 0:
+            day = 7
         start_node = max(1, int(d.get("startNode", 1)))
         step = max(1, int(d.get("step", 1)))
         end_node = start_node + step - 1
@@ -513,14 +515,14 @@ def _expand_rrule_dates(
 
     ex_set = set(exdates)
     dates: List[date] = []
-    max_occurrences = count if count is not None else 30
+    max_occurrences = count if count is not None else 200
 
     if freq == "WEEKLY":
         base_date = start_dt.date()
         base_monday = base_date - timedelta(days=base_date.isoweekday() - 1)
         target_weekdays = sorted(set(bydays)) if bydays else [base_date.isoweekday()]
         week_idx = 0
-        while len(dates) < max_occurrences and week_idx < 40:
+        while len(dates) < max_occurrences and week_idx < 52:
             week_monday = base_monday + timedelta(weeks=week_idx * interval)
             for wd in target_weekdays:
                 d = week_monday + timedelta(days=wd - 1)
