@@ -176,8 +176,8 @@ def parse_valid_hhmm(raw: str) -> Optional[str]:
 @register(
     "astrbot_plugin_schedule",
     "AstrBot Developer",
-    "为AstrBot设计的课程表插件，支持.ics与WakeUp口令绑定、三种精美渲染样式、课前@提醒、早八前夜@提醒、周日下周上课情况排行推送，深度适配QQ官方机器人",
-    "1.2.0",
+    "为AstrBot设计的课程表插件，支持.ics与WakeUp口令绑定、动态节次/课间/周数自适应、三种精美渲染样式、课前@提醒、早八前夜@提醒、周日下周上课情况排行推送，深度适配QQ官方机器人",
+    "1.3.0",
     "https://github.com/astrbot/astrbot_plugin_schedule",
 )
 class SchedulePlugin(Star):
@@ -511,12 +511,18 @@ class SchedulePlugin(Star):
         cur_week = schedule.get_week_number(now.date())
         display_name = prof.get_display_name(group_id)
         unique_names = len({c.course_name for c in schedule.courses})
+        first_slot = (
+            f"{schedule.time_slots[0].start_time}-{schedule.time_slots[0].end_time}"
+            if schedule.time_slots
+            else "08:00-08:45"
+        )
 
         lines = [
             f"🎉 课表绑定成功！（来源：{source_desc}）",
             f"👤 绑定用户：{display_name}",
             f"📚 课表名称：{schedule.table_name}",
-            f"📅 学期基准：{schedule.start_date}（当前为第 {cur_week} 周）",
+            f"📅 学期周数：第一周始于 {schedule.start_date}（当前为第 {cur_week}/{schedule.max_week} 周，可发 /设置当前周 调整）",
+            f"🕒 节次时间：每日共 {schedule.max_nodes} 节（第1节 {first_slot}，已根据课表文件动态匹配每节课时长与课间）",
             f"📊 课程统计：共 {unique_names} 门课程 / {len(schedule.courses)} 条排课记录",
             "",
             "👉 常用指令：/查看课表、/今日课表、/本周课表、/群友在上什么课、/本周上课排行、/课前提醒、/早八提醒、/周日推送",
@@ -1301,7 +1307,7 @@ class SchedulePlugin(Star):
         if sched:
             cur_week = sched.get_week_number(now.date())
             sched_status = (
-                f"已绑定（{sched.table_name} · 来源 {sched.source_type.upper()} · 当前第 {cur_week} 周 · 共 {len(sched.courses)} 条排课）"
+                f"已绑定（{sched.table_name} · 来源 {sched.source_type.upper()} · 当前第 {cur_week}/{sched.max_week} 周 · 每日 {sched.max_nodes} 节 · 共 {len(sched.courses)} 条排课）"
             )
         else:
             sched_status = "未绑定（发送 /绑定课表 即可绑定）"
@@ -1385,6 +1391,64 @@ class SchedulePlugin(Star):
             msg += f"，已关联 QQ 号：{prof.qq_number}（已同步 QQ 头像）"
         yield event.plain_result(msg)
 
+    @filter.command("设置当前周", alias={"设置周数", "修改周数", "修改当前周"})
+    async def cmd_set_current_week(self, event: AstrMessageEvent):
+        """动态调整个人课表当前所在周数（并可同步附带总周数，如 /设置当前周 11 18）"""
+        prof, _ = await self._sync_user_from_event(event)
+        sched = self.storage.get_schedule(prof.user_id)
+        if not sched:
+            yield event.plain_result("⚠️ 你还没有绑定课表哦！请先发送 /绑定课表 进行绑定。")
+            return
+
+        arg = self._extract_command_arg(
+            event, ["设置当前周", "设置周数", "修改周数", "修改当前周"]
+        )
+        now = now_in_tz(self.timezone)
+        cur_w = sched.get_week_number(now.date())
+        if not arg:
+            yield event.plain_result(
+                f"📅 你当前课表为：第 {cur_w} 周（总周数：{sched.max_week} 周，第一周周一：{sched.start_date}）。\n"
+                f"如需调整，请发送：/设置当前周 <当前周数> [总周数]\n"
+                f"示例：/设置当前周 11 或 /设置当前周 11 18"
+            )
+            return
+
+        nums = [int(x) for x in re.findall(r"\d+", arg)]
+        if not nums or not (1 <= nums[0] <= 40):
+            yield event.plain_result("⚠️ 周数格式无效！请输入 1 到 40 之间的整数周数（例如：/设置当前周 11）。")
+            return
+
+        target_cur_week = nums[0]
+        sched.set_current_week(target_cur_week, reference_date=now.date())
+        if len(nums) >= 2 and 1 <= nums[1] <= 40:
+            sched.max_week = max(target_cur_week, nums[1])
+        self.storage.save_schedule(prof.user_id, sched)
+
+        yield event.plain_result(
+            f"✅ 已将你的课表更新为：当前第 {target_cur_week} 周（学期总周数：{sched.max_week} 周，第一周周一基准：{sched.start_date}）！"
+        )
+
+    @filter.command("设置总周数", alias={"修改总周数"})
+    async def cmd_set_max_week(self, event: AstrMessageEvent):
+        """设置个人课表的学期总周数"""
+        prof, _ = await self._sync_user_from_event(event)
+        sched = self.storage.get_schedule(prof.user_id)
+        if not sched:
+            yield event.plain_result("⚠️ 你还没有绑定课表哦！请先发送 /绑定课表 进行绑定。")
+            return
+
+        arg = self._extract_command_arg(event, ["设置总周数", "修改总周数"])
+        nums = [int(x) for x in re.findall(r"\d+", arg)]
+        if not nums or not (1 <= nums[0] <= 40):
+            yield event.plain_result(
+                f"📅 当前课表学期总周数为：{sched.max_week} 周。\n请发送：/设置总周数 <周数>（如 /设置总周数 18）。"
+            )
+            return
+
+        sched.max_week = nums[0]
+        self.storage.save_schedule(prof.user_id, sched)
+        yield event.plain_result(f"✅ 已将你的课表学期总周数设置为：{sched.max_week} 周！")
+
     @filter.command("解绑课表", alias={"删除课表"})
     async def cmd_unbind_schedule(self, event: AstrMessageEvent):
         """解绑并删除个人课表数据"""
@@ -1399,13 +1463,13 @@ class SchedulePlugin(Star):
     async def cmd_schedule_help(self, event: AstrMessageEvent):
         """显示课程表插件所有指令说明"""
         help_lines = [
-            "📖 【AstrBot 课程表插件指令列表 (v1.2.0)】",
-            "1. /绑定课表 ：发送 .ics 文件或 WakeUp 分享口令绑定课表",
+            "📖 【AstrBot 课程表插件指令列表 (v1.3.0)】",
+            "1. /绑定课表 ：发送 .ics 文件或 WakeUp 分享口令绑定课表（自动识别每节课时间、时长、课间与周数）",
             "2. /查看课表 ：显示自己今天接下来要上的课程（图片）",
             "3. /今日课表 ：输出今日完整课表图片",
             "4. /明日课表 ：输出明日课表图片",
-            "5. /本周课表 ：输出本周课表网格图片（含周六周日）",
-            "6. /下周课表 ：输出下周课表网格图片（含周六周日）",
+            "5. /本周课表 ：输出本周课表网格图片（含周六周日与动态节次时间轴）",
+            "6. /下周课表 ：输出下周课表网格图片（含周六周日与动态节次时间轴）",
             "7. /群友在上什么课 ：查看群内所有已绑定成员当前上课/空闲状态",
             "8. /群友明天上什么课 ：查看群内所有成员明天的课程安排",
             "9. /本周上课排行 ：查看本周群友上课时长与节数排行榜",
@@ -1418,9 +1482,10 @@ class SchedulePlugin(Star):
             "16. /设置早八时间 ：设置几点及之前开始的课算早八（如 08:00）",
             "17. /周日推送 ：控制周日自动推送下周上课情况图的开关与时间",
             "18. /设置周日推送时间 ：设置周日几点推送下周上课情况（如 20:00）",
-            "19. /查看设置 ：查看当前所有配置",
-            "20. /设置昵称 <群昵称> [QQ号] ：自定义群昵称与关联QQ头像",
-            "21. /解绑课表 ：清除已绑定的个人课表",
+            "19. /设置当前周 <周数> [总周数] ：动态调整个人当前上课周数与学期总周数",
+            "20. /查看设置 ：查看当前所有配置",
+            "21. /设置昵称 <群昵称> [QQ号] ：自定义群昵称与关联QQ头像",
+            "22. /解绑课表 ：清除已绑定的个人课表",
         ]
         yield event.plain_result("\n".join(help_lines))
 
