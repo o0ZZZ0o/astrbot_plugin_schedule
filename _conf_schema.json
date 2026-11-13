@@ -1,0 +1,32 @@
+{
+  "qq_appid": {
+    "description": "QQ官方机器人 AppID（可选，用于拼接 OpenID 头像链接；留空时插件会自动尝试从平台适配器中读取）",
+    "type": "string",
+    "default": "",
+    "hint": "在腾讯QQ开放平台获取的机器人 AppID，如 102030405"
+  },
+  "timezone": {
+    "description": "默认时区设置（自动处理时区，确保时间准确）",
+    "type": "string",
+    "default": "Asia/Shanghai",
+    "hint": "标准 IANA 时区名称，默认为 Asia/Shanghai (UTC+8)"
+  },
+  "wakeup_api_url": {
+    "description": "WakeUp 课程表口令解析接口地址",
+    "type": "string",
+    "default": "https://i.wakeup.fun/share_schedule/get",
+    "hint": "默认为 https://i.wakeup.fun/share_schedule/get，备用 https://api.wakeup.fun/share_schedule/get"
+  },
+  "session_timeout": {
+    "description": "交互式会话等待超时时间（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "发送 /绑定课表、/设置每日推送、/设置提醒时间 后等待回复的超时秒数"
+  },
+  "default_daily_push_time": {
+    "description": "默认每日推送时间（用户未单独配置但开启时的默认时间）",
+    "type": "string",
+    "default": "07:30",
+    "hint": "格式为 HH:MM，如 07:30"
+  }
+}

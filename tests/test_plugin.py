@@ -1,0 +1,557 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import tempfile
+import unittest
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import sys
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.models import get_tz
+from core.parser import (
+    extract_wakeup_key,
+    parse_ics_content,
+    parse_wakeup_raw_data,
+)
+from core.qq_official import (
+    build_candidate_avatar_urls,
+    extract_event_identity,
+    extract_qq_official_appid,
+)
+from main import SchedulePlugin
+
+
+SAMPLE_ICS = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//WakeUp Schedule//CN
+X-WR-CALNAME:2026秋季学期课表
+BEGIN:VEVENT
+DTSTART;TZID=Asia/Shanghai:20261109T080000
+DTEND;TZID=Asia/Shanghai:20261109T093500
+RRULE:FREQ=WEEKLY;COUNT=16
+SUMMARY:高等数学(上)
+LOCATION:理教201
+DESCRIPTION:第1 - 2节\\n理教201\\n王教授
+END:VEVENT
+BEGIN:VEVENT
+DTSTART:20261113T020000Z
+DTEND:20261113T033500Z
+SUMMARY:大学物理实验
+LOCATION:物理楼305
+DESCRIPTION:第3-4节\\n教师: 李老师
+END:VEVENT
+BEGIN:VEVENT
+DTSTART;TZID=Asia/Shanghai:20261113T140000
+DTEND;TZID=Asia/Shanghai:20261113T153500
+SUMMARY:计算机网络
+LOCATION:信息楼402
+DESCRIPTION:第6 - 7节\\n信息楼402\\n赵老师
+END:VEVENT
+BEGIN:VEVENT
+DTSTART;TZID=Asia/Shanghai:20261114T080000
+DTEND;TZID=Asia/Shanghai:20261114T093500
+SUMMARY:程序设计实践
+LOCATION:机房B102
+DESCRIPTION:第1 - 2节\\n机房B102\\n陈老师
+END:VEVENT
+END:VCALENDAR
+"""
+
+SAMPLE_WAKEUP_5LINES = "\n".join(
+    [
+        json.dumps({"courseLen": 45, "theBreakLen": 5, "sameLen": True}),
+        json.dumps(
+            [
+                {"node": 1, "startTime": "08:00", "endTime": "08:45", "timeTable": 1},
+                {"node": 2, "startTime": "08:50", "endTime": "09:35", "timeTable": 1},
+                {"node": 3, "startTime": "09:50", "endTime": "10:35", "timeTable": 1},
+                {"node": 4, "startTime": "10:40", "endTime": "11:25", "timeTable": 1},
+                {"node": 5, "startTime": "11:30", "endTime": "12:15", "timeTable": 1},
+                {"node": 6, "startTime": "14:00", "endTime": "14:45", "timeTable": 1},
+                {"node": 7, "startTime": "14:50", "endTime": "15:35", "timeTable": 1},
+                {"node": 8, "startTime": "15:50", "endTime": "16:35", "timeTable": 1},
+            ]
+        ),
+        json.dumps(
+            {
+                "startDate": "2026-09-07",
+                "maxWeek": 20,
+                "nodes": 12,
+                "tableName": "WakeUp测试课表",
+                "sundayFirst": False,
+            }
+        ),
+        json.dumps(
+            [
+                {"id": 0, "courseName": "数据结构与算法", "color": "#4F46E5"},
+                {"id": 1, "courseName": "操作系统原理", "color": "#0D9488"},
+            ]
+        ),
+        json.dumps(
+            [
+                {
+                    "id": 0,
+                    "day": 5,
+                    "startNode": 1,
+                    "step": 2,
+                    "startWeek": 1,
+                    "endWeek": 18,
+                    "type": 0,
+                    "room": "科教楼101",
+                    "teacher": "林教授",
+                },
+                {
+                    "id": 1,
+                    "day": 5,
+                    "startNode": 6,
+                    "step": 3,
+                    "startWeek": 1,
+                    "endWeek": 18,
+                    "type": 0,
+                    "room": "科教楼302",
+                    "teacher": "周教授",
+                },
+                {
+                    "id": 0,
+                    "day": 6,
+                    "startNode": 3,
+                    "step": 2,
+                    "startWeek": 1,
+                    "endWeek": 18,
+                    "type": 0,
+                    "room": "实验楼204",
+                    "teacher": "林教授",
+                },
+            ]
+        ),
+    ]
+)
+
+
+class FakeContext:
+    def __init__(self, appid: str = "102030405"):
+        self.sent_messages: List[Dict[str, Any]] = []
+        self.platform_manager = type(
+            "PM",
+            (),
+            {
+                "platform_insts": [
+                    type("Inst", (), {"config": {"appid": appid}})()
+                ]
+            },
+        )()
+
+    async def send_message(self, umo: str, chain: Any) -> None:
+        self.sent_messages.append({"umo": umo, "chain": chain})
+
+
+class FakeQQOfficialEvent:
+    """模拟 AstrBot 下 QQ 官方机器人 (qq_official) 消息事件"""
+
+    def __init__(
+        self,
+        message_str: str,
+        member_openid: str = "9F8E7D6C5B4A32109F8E7D6C5B4A3210",
+        group_openid: str = "GROUP_OPENID_888888",
+        sender_name: str = "",
+        attachments: Optional[List[Dict[str, str]]] = None,
+    ):
+        self.message_str = message_str
+        self._sender_id = member_openid
+        self._group_id = group_openid
+        self._sender_name = sender_name
+        self.unified_msg_origin = (
+            f"qq_official:GroupMessage:{member_openid}_{group_openid}"
+            if group_openid
+            else f"qq_official:FriendMessage:{member_openid}"
+        )
+        raw_msg = {
+            "group_openid": group_openid,
+            "author": {
+                "member_openid": member_openid,
+                "id": member_openid,
+            },
+            "attachments": attachments or [],
+        }
+        if sender_name:
+            raw_msg["member"] = {"nick": sender_name}
+        self.message_obj = type(
+            "MsgObj",
+            (),
+            {
+                "group_id": group_openid,
+                "sender": type("Sender", (), {"nickname": sender_name, "card": ""})(),
+                "raw_message": raw_msg,
+                "message": [],
+            },
+        )()
+        self.bot = type("Bot", (), {"appid": "102030405"})()
+
+    def get_platform_name(self) -> str:
+        return "qq_official"
+
+    def get_sender_id(self) -> str:
+        return self._sender_id
+
+    def get_group_id(self) -> str:
+        return self._group_id
+
+    def get_sender_name(self) -> str:
+        return self._sender_name or self._sender_id
+
+    def plain_result(self, text: str) -> Dict[str, str]:
+        return {"type": "plain", "text": text}
+
+    def image_result(self, path: str) -> Dict[str, str]:
+        return {"type": "image", "path": path}
+
+    def stop_event(self) -> None:
+        pass
+
+
+async def collect_gen(agen) -> List[Dict[str, str]]:
+    out = []
+    async for item in agen:
+        out.append(item)
+    return out
+
+
+class TestSchedulePlugin(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.data_path = Path(self.tmp_dir.name)
+        self.ctx = FakeContext(appid="102099999")
+        self.plugin = SchedulePlugin(
+            context=self.ctx,
+            config={"timezone": "Asia/Shanghai", "qq_appid": "102099999"},
+            data_dir=self.data_path,
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.plugin.terminate()
+        self.tmp_dir.cleanup()
+
+    def test_wakeup_key_extraction_and_parsing(self) -> None:
+        share_msg = (
+            "这是来自「WakeUp课程表」的课表分享，30分钟内有效哦，如果失效请朋友再分享一次叭。"
+            "请复制这条消息后打开App导入~分享口令为「a1b2c3d4e5f60718293a4b5c6d7e8f00」"
+        )
+        key = extract_wakeup_key(share_msg)
+        self.assertEqual(key, "a1b2c3d4e5f60718293a4b5c6d7e8f00")
+
+        sched = parse_wakeup_raw_data(SAMPLE_WAKEUP_5LINES)
+        self.assertEqual(sched.table_name, "WakeUp测试课表")
+        self.assertEqual(len(sched.courses), 3)
+
+        # 2026-11-13 是周五 (第10周)
+        tz = get_tz("Asia/Shanghai")
+        now_dt = datetime(2026, 11, 13, 8, 30, tzinfo=tz)
+        friday_courses = sched.get_courses_for_date(date(2026, 11, 13), now=now_dt)
+        self.assertEqual(len(friday_courses), 2)
+        self.assertEqual(friday_courses[0].course_name, "数据结构与算法")
+        self.assertEqual(friday_courses[0].status, "ongoing")
+        self.assertIn("进行中", friday_courses[0].status_text)
+        self.assertEqual(friday_courses[1].course_name, "操作系统原理")
+        self.assertEqual(friday_courses[1].status, "next")
+        self.assertIn("下一节", friday_courses[1].status_text)
+
+    def test_ics_parsing_and_utc_timezone_conversion(self) -> None:
+        sched = parse_ics_content(SAMPLE_ICS, tz_name="Asia/Shanghai")
+        self.assertEqual(sched.table_name, "2026秋季学期课表")
+
+        # 检查 2026-11-13 (周五) 的 UTC 时间 02:00Z 是否被正确转换为北京时间 10:00
+        tz = get_tz("Asia/Shanghai")
+        now_dt = datetime(2026, 11, 13, 9, 50, tzinfo=tz)
+        courses = sched.get_courses_for_date(date(2026, 11, 13), now=now_dt)
+        self.assertEqual(len(courses), 2)
+        self.assertEqual(courses[0].course_name, "大学物理实验")
+        self.assertEqual(courses[0].start_time, "10:00")
+        self.assertEqual(courses[0].end_time, "11:35")
+        self.assertEqual(courses[0].teacher, "李老师")
+        self.assertEqual(courses[0].status, "next")
+
+    def test_qq_official_identity_and_avatar_urls(self) -> None:
+        ev = FakeQQOfficialEvent(
+            message_str="/查看课表",
+            member_openid="9F8E7D6C5B4A32109F8E7D6C5B4A3210",
+            group_openid="GROUP_OPENID_888888",
+            sender_name="",  # 模拟 QQ 官方群聊未返回昵称
+        )
+        ident = extract_event_identity(ev)
+        self.assertEqual(ident["platform"], "qq_official")
+        self.assertEqual(ident["user_id"], "9F8E7D6C5B4A32109F8E7D6C5B4A3210")
+        self.assertEqual(ident["group_id"], "GROUP_OPENID_888888")
+
+        appid = extract_qq_official_appid(event=ev, context=self.ctx)
+        self.assertEqual(appid, "102030405")
+
+        prof = self.plugin.storage.get_profile(ident["user_id"])
+        # 绝不直接暴露 32 位 OpenID
+        self.assertNotEqual(prof.get_display_name(), ident["user_id"])
+        self.assertEqual(prof.get_display_name(), "群友#3210")
+
+        urls = build_candidate_avatar_urls(prof, appid=appid)
+        self.assertTrue(
+            any("thirdqq.qlogo.cn/qqapp/102030405/9F8E7D6C5B4A32109F8E7D6C5B4A3210/100" in u for u in urls)
+        )
+
+    async def test_all_commands_and_three_render_styles(self) -> None:
+        # 用户 A：通过两步交互发送 .ics 绑定课表，并设置群昵称
+        ev1 = FakeQQOfficialEvent(
+            message_str="/绑定课表",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+            sender_name="学霸小明",
+        )
+        res1 = await collect_gen(self.plugin.cmd_bind_schedule(ev1))
+        self.assertIn("请在 120 秒内发送", res1[0]["text"])
+
+        ev1_reply = FakeQQOfficialEvent(
+            message_str=SAMPLE_ICS,
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+            sender_name="学霸小明",
+        )
+        res1_reply = await collect_gen(
+            self.plugin.on_Fallback_session_message(ev1_reply)
+        )
+        self.assertIn("课表绑定成功", res1_reply[0]["text"])
+        self.assertIn("学霸小明", res1_reply[0]["text"])
+
+        # 用户 B：通过单步内联 WakeUp 数据绑定课表，并通过 /设置昵称 绑定群昵称和 QQ 号
+        ev2 = FakeQQOfficialEvent(
+            message_str=f"/绑定课表 {SAMPLE_WAKEUP_5LINES}",
+            member_openid="OPENID_USER_BBB22222222222222222",
+            group_openid="GROUP_OPENID_1001",
+            sender_name="",  # 官方机器人未返回昵称
+        )
+        res2 = await collect_gen(self.plugin.cmd_bind_schedule(ev2))
+        self.assertIn("课表绑定成功", res2[0]["text"])
+
+        ev2_nick = FakeQQOfficialEvent(
+            message_str="/设置昵称 摸鱼阿华 123456789",
+            member_openid="OPENID_USER_BBB22222222222222222",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_nick = await collect_gen(self.plugin.cmd_set_nickname(ev2_nick))
+        self.assertIn("摸鱼阿华", res_nick[0]["text"])
+        self.assertIn("123456789", res_nick[0]["text"])
+
+        # 测试图片指令：/查看课表、/今日课表、/明日课表、/本周课表、/下周课表
+        for cmd_fn in [
+            self.plugin.cmd_view_schedule,
+            self.plugin.cmd_today_schedule,
+            self.plugin.cmd_tomorrow_schedule,
+            self.plugin.cmd_this_week_schedule,
+            self.plugin.cmd_next_week_schedule,
+        ]:
+            out = await collect_gen(cmd_fn(ev1))
+            self.assertEqual(out[0]["type"], "image")
+            img_file = Path(out[0]["path"])
+            self.assertTrue(img_file.exists())
+            self.assertGreater(img_file.stat().st_size, 60)
+
+        # 测试群友指令（样式二 & 样式三）：/群友在上什么课、/群友明天上什么课、/本周上课排行
+        for group_cmd_fn in [
+            self.plugin.cmd_group_current_courses,
+            self.plugin.cmd_group_tomorrow_courses,
+            self.plugin.cmd_weekly_ranking,
+        ]:
+            out = await collect_gen(group_cmd_fn(ev2))
+            self.assertEqual(out[0]["type"], "image")
+            img_file = Path(out[0]["path"])
+            self.assertTrue(img_file.exists())
+            self.assertGreater(img_file.stat().st_size, 60)
+
+        # 测试 /设置每日推送 （分步回复 "开启 07:00"）
+        ev_push = FakeQQOfficialEvent(
+            message_str="/设置每日推送",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        await collect_gen(self.plugin.cmd_set_daily_push(ev_push))
+        ev_push_reply = FakeQQOfficialEvent(
+            message_str="开启 07:00",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_push = await collect_gen(
+            self.plugin.on_Fallback_session_message(ev_push_reply)
+        )
+        self.assertIn("07:00", res_push[0]["text"])
+
+        # 测试 /设置提醒时间 （分步回复 "20"）
+        ev_rem = FakeQQOfficialEvent(
+            message_str="/设置提醒时间",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        await collect_gen(self.plugin.cmd_set_reminder_time(ev_rem))
+        ev_rem_reply = FakeQQOfficialEvent(
+            message_str="20",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_rem = await collect_gen(
+            self.plugin.on_Fallback_session_message(ev_rem_reply)
+        )
+        self.assertIn("提前 20 分钟", res_rem[0]["text"])
+
+        # 测试 /查看设置
+        ev_view_cfg = FakeQQOfficialEvent(
+            message_str="/查看设置",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_cfg = await collect_gen(self.plugin.cmd_view_settings(ev_view_cfg))
+        self.assertIn("学霸小明", res_cfg[0]["text"])
+        self.assertIn("07:00", res_cfg[0]["text"])
+        self.assertIn("20 分钟", res_cfg[0]["text"])
+
+        # 测试定时推送与开课前提醒触发
+        tz = get_tz("Asia/Shanghai")
+        # 1) 早上 07:05 触发每日课表推送
+        triggered_morning = await self.plugin.run_scheduled_checks(
+            now=datetime(2026, 11, 13, 7, 5, tzinfo=tz)
+        )
+        self.assertEqual(len(triggered_morning), 1)
+        self.assertEqual(triggered_morning[0]["type"], "daily_push")
+        self.assertTrue(triggered_morning[0]["sent"])
+
+        # 同一天 07:10 再次检查，不应重复推送
+        triggered_dup = await self.plugin.run_scheduled_checks(
+            now=datetime(2026, 11, 13, 7, 10, tzinfo=tz)
+        )
+        self.assertEqual(len(triggered_dup), 0)
+
+        # 2) 09:45（距离 10:00 的《大学物理实验》还有 15 分钟 <= 20 分钟）触发课前提醒
+        triggered_rem = await self.plugin.run_scheduled_checks(
+            now=datetime(2026, 11, 13, 9, 45, tzinfo=tz)
+        )
+        self.assertEqual(len(triggered_rem), 1)
+        self.assertEqual(triggered_rem[0]["type"], "class_reminder")
+        self.assertEqual(triggered_rem[0]["course_name"], "大学物理实验")
+        self.assertIn("15 分钟", triggered_rem[0]["text"])
+
+    def test_pil_rendering_code_paths_with_mock_pil(self) -> None:
+        """验证当 Pillow (PIL) 启用时，三种渲染样式的所有绘图分支均无语法或逻辑错误"""
+        import core.renderer as rmod
+        from core.renderer import create_minimal_png
+
+        class FakeDraw:
+            def rectangle(self, *args, **kwargs):
+                pass
+
+            def rounded_rectangle(self, *args, **kwargs):
+                pass
+
+            def ellipse(self, *args, **kwargs):
+                pass
+
+            def line(self, *args, **kwargs):
+                pass
+
+            def text(self, *args, **kwargs):
+                pass
+
+            def textbbox(self, xy, text, font=None):
+                return (0, 0, len(str(text)) * 12, 18)
+
+        class FakeImage:
+            class Resampling:
+                LANCZOS = 1
+
+            def __init__(self, mode="RGB", size=(800, 600), color=(255, 255, 255)):
+                self.mode = mode
+                self.size = size
+
+            @classmethod
+            def new(cls, mode, size, color=0):
+                return cls(mode, size, color)
+
+            @classmethod
+            def open(cls, fp):
+                return cls("RGBA", (100, 100))
+
+            def convert(self, mode):
+                return self
+
+            def resize(self, size, resample=None):
+                return FakeImage(self.mode, size)
+
+            def paste(self, im, box=None, mask=None):
+                pass
+
+            def save(self, fp, format="PNG"):
+                Path(fp).write_bytes(create_minimal_png(self.size[0], self.size[1]))
+
+        class FakeFontObj:
+            def getmask(self, text):
+                return text.encode("utf-8")
+
+        class FakeFont:
+            @staticmethod
+            def truetype(path, size, index=0):
+                return FakeFontObj()
+
+            @staticmethod
+            def load_default():
+                return FakeFontObj()
+
+        orig_has_pil = rmod.HAS_PIL
+        try:
+            rmod.HAS_PIL = True
+            rmod.Image = FakeImage
+            rmod.ImageDraw = type("ID", (), {"Draw": lambda im: FakeDraw()})
+            rmod.ImageFont = FakeFont
+
+            sched_ics = parse_ics_content(SAMPLE_ICS, tz_name="Asia/Shanghai")
+            sched_wu = parse_wakeup_raw_data(SAMPLE_WAKEUP_5LINES)
+            prof_a = self.plugin.storage.update_user_context(
+                "USER_A", group_id="G1", nickname="张同学"
+            )
+            prof_b = self.plugin.storage.update_user_context(
+                "USER_B", group_id="G1", nickname="李同学"
+            )
+            tz = get_tz("Asia/Shanghai")
+            now_dt = datetime(2026, 11, 13, 8, 30, tzinfo=tz)
+
+            p1 = self.plugin.renderer.render_personal_daily(
+                prof_a, sched_wu, date(2026, 11, 13), now=now_dt, group_id="G1"
+            )
+            p2 = self.plugin.renderer.render_personal_weekly(
+                prof_a, sched_wu, date(2026, 11, 9), now=now_dt, group_id="G1"
+            )
+            p3 = self.plugin.renderer.render_group_overview(
+                [(prof_a, sched_wu, None), (prof_b, sched_ics, None)],
+                group_id="G1",
+                now=now_dt,
+                is_tomorrow=False,
+            )
+            p4 = self.plugin.renderer.render_group_overview(
+                [(prof_a, sched_wu, None), (prof_b, sched_ics, None)],
+                group_id="G1",
+                now=now_dt,
+                is_tomorrow=True,
+            )
+            p5 = self.plugin.renderer.render_weekly_ranking(
+                [(prof_a, sched_wu, None), (prof_b, sched_ics, None)],
+                group_id="G1",
+                now=now_dt,
+            )
+            for p in (p1, p2, p3, p4, p5):
+                self.assertTrue(p.exists())
+                self.assertGreater(p.stat().st_size, 60)
+        finally:
+            rmod.HAS_PIL = orig_has_pil
+
+
+if __name__ == "__main__":
+    unittest.main()
