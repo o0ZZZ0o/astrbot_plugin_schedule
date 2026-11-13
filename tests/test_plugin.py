@@ -540,6 +540,107 @@ class TestSchedulePlugin(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(triggered_sun[0]["type"], "sunday_next_week_push")
         self.assertTrue(Path(triggered_sun[0]["image_path"]).exists())
 
+        # 5) 测试 /设置当前周 与 /设置总周数 动态调整个人周数后提醒依然有效
+        ev_set_wk = FakeQQOfficialEvent(
+            message_str="/设置当前周 11 18",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_set_wk = await collect_gen(self.plugin.cmd_set_current_week(ev_set_wk))
+        self.assertIn("当前第 11 周", res_set_wk[0]["text"])
+        self.assertIn("18 周", res_set_wk[0]["text"])
+
+    def test_dynamic_time_slots_durations_breaks_and_weeks(self) -> None:
+        """
+        验证不同用户的课程开始时间、结束时间、单节时长、每节课间隙、以及不同上课周数的动态自适应：
+        1. 河南大学等高校 100分钟(2节, 45m+10m课间) + 150分钟(3节, 10:00-12:30) + 下午 16:40-18:20(9-10节) 的 .ics 课表
+        2. 已持久化的旧版 JSON 课表在加载时自动修正 time_slots 与周数
+        3. 不同周数与非连续周 (1-8,10-16周) 的精确匹配
+        """
+        henu_like_ics = "\r\n".join(
+            [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                "X-WR-CALNAME:金明校区动态课表",
+                "BEGIN:VEVENT",
+                "DTSTART;TZID=Asia/Shanghai:20261110T080000",
+                "DTEND;TZID=Asia/Shanghai:20261110T094000",
+                "RRULE:FREQ=WEEKLY;COUNT=6",
+                "SUMMARY:大学体育（三）",
+                "DESCRIPTION:第1 - 2节\\n徐怡康\\n第11-16周",
+                "END:VEVENT",
+                "BEGIN:VEVENT",
+                "DTSTART;TZID=Asia/Shanghai:20261109T100000",
+                "DTEND;TZID=Asia/Shanghai:20261109T114000",
+                "RRULE:FREQ=WEEKLY;COUNT=6",
+                "SUMMARY:数据结构",
+                "LOCATION:金明综合楼4101",
+                "DESCRIPTION:第3 - 4节\\n金明综合楼4101\\n王龙葛\\n第11-16周",
+                "END:VEVENT",
+                "BEGIN:VEVENT",
+                "DTSTART;TZID=Asia/Shanghai:20261113T100000",
+                "DTEND;TZID=Asia/Shanghai:20261113T123000",
+                "RRULE:FREQ=WEEKLY;COUNT=6",
+                "SUMMARY:毛泽东思想和中国特色社会主义理论体系概论",
+                "LOCATION:金明综合楼2101",
+                "DESCRIPTION:第3 - 5节\\n金明综合楼2101\\n郑炳凯\\n第11-16周",
+                "END:VEVENT",
+                "BEGIN:VEVENT",
+                "DTSTART;TZID=Asia/Shanghai:20261109T164000",
+                "DTEND;TZID=Asia/Shanghai:20261109T182000",
+                "RRULE:FREQ=WEEKLY;COUNT=6",
+                "SUMMARY:食品中的科技与狠活",
+                "LOCATION:金明综合楼3306",
+                "DESCRIPTION:第9 - 10节\\n金明综合楼3306\\n马凡怡\\n第11-16周",
+                "END:VEVENT",
+                "BEGIN:VEVENT",
+                "DTSTART;TZID=Asia/Shanghai:20261112T192000",
+                "DTEND;TZID=Asia/Shanghai:20261112T210000",
+                "RRULE:FREQ=WEEKLY;COUNT=6",
+                "SUMMARY:数字逻辑",
+                "LOCATION:金明综合楼6503",
+                "DESCRIPTION:第11 - 12节\\n金明综合楼6503\\n侯巍\\n第11-16周",
+                "END:VEVENT",
+                "END:VCALENDAR",
+            ]
+        )
+
+        sched = parse_ics_content(henu_like_ics, tz_name="Asia/Shanghai")
+        slot_map = {s.node: s for s in sched.time_slots}
+
+        # 验证根据课表文件动态推算的节次起止时间与课间间隙（不再是写死的 09:50-12:15 或 18:30-19:15）
+        self.assertEqual(slot_map[1].start_time, "08:00")
+        self.assertEqual(slot_map[2].end_time, "09:40")
+        self.assertEqual(slot_map[3].start_time, "10:00")
+        self.assertEqual(slot_map[4].end_time, "11:40")
+        self.assertEqual(slot_map[5].end_time, "12:30")
+        self.assertEqual(slot_map[9].start_time, "16:40")
+        self.assertEqual(slot_map[10].end_time, "18:20")
+        self.assertEqual(slot_map[11].start_time, "19:20")
+        self.assertEqual(slot_map[12].end_time, "21:00")
+
+        # 验证根据 DESCRIPTION 中的“第11-16周”动态锚定当前周数（2026-11-13 为第 11 周，总周数 16 周）
+        self.assertEqual(sched.get_week_number(date(2026, 11, 13)), 11)
+        self.assertEqual(sched.max_week, 16)
+
+        # 验证周五课程时长为 150 分钟 (2.5小时)
+        fri_courses = sched.get_courses_for_date(date(2026, 11, 13))
+        self.assertEqual(len(fri_courses), 1)
+        self.assertEqual(fri_courses[0].start_time, "10:00")
+        self.assertEqual(fri_courses[0].end_time, "12:30")
+        self.assertEqual(fri_courses[0].duration_minutes, 150)
+
+        # 验证旧版已存盘的 JSON（带默认节次表）在 ScheduleData.from_dict 加载时自动动态校准
+        from core.models import DEFAULT_TIME_SLOTS, ScheduleData
+
+        raw_saved = sched.to_dict()
+        raw_saved["time_slots"] = DEFAULT_TIME_SLOTS
+        reloaded = ScheduleData.from_dict(raw_saved)
+        reloaded_map = {s.node: s for s in reloaded.time_slots}
+        self.assertEqual(reloaded_map[3].start_time, "10:00")
+        self.assertEqual(reloaded_map[5].end_time, "12:30")
+        self.assertEqual(reloaded_map[10].end_time, "18:20")
+
     def test_pil_rendering_code_paths_with_mock_pil(self) -> None:
         """验证当 Pillow (PIL) 启用时，三种渲染样式的所有绘图分支均无语法或逻辑错误"""
         import core.renderer as rmod

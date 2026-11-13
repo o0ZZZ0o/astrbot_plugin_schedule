@@ -14,8 +14,13 @@ from .models import (
     CourseRule,
     ScheduleData,
     TimeSlot,
+    build_dynamic_time_slots_from_courses,
+    build_slots_for_unnumbered_events,
     get_tz,
+    hhmm_to_minutes,
     infer_nodes_from_time,
+    infer_unit_and_break_minutes,
+    minutes_to_hhmm,
     now_in_tz,
 )
 
@@ -53,7 +58,6 @@ def extract_wakeup_key(text: str) -> Optional[str]:
     if not text:
         return None
     text = text.strip()
-    # 1. 优先匹配「...」中的 32 位口令
     patterns = [
         r"分享口令为\s*[「『\"'【\[]?\s*([0-9a-fA-F]{32})\s*[」』\"'】\]]?",
         r"口令\s*[为：:]?\s*[「『\"'【\[]?\s*([0-9a-fA-F]{32})\s*[」』\"'】\]]?",
@@ -108,7 +112,6 @@ async def fetch_and_parse_wakeup(
 ) -> ScheduleData:
     """通过 WakeUp 分享口令或原始数据解析课表"""
     stripped = share_input.strip()
-    # 如果直接传入了 5 行 wakeup_schedule 内容或 JSON
     if stripped.startswith("{") and ("\n[" in stripped or "courseList" in stripped):
         return parse_wakeup_raw_data(stripped, tz_name=tz_name)
 
@@ -121,7 +124,6 @@ async def fetch_and_parse_wakeup(
         "https://i.wakeup.fun/share_schedule/get",
         "https://api.wakeup.fun/share_schedule/get",
     ]
-    # 去重保序
     unique_endpoints: List[str] = []
     for ep in endpoints:
         if ep and ep not in unique_endpoints:
@@ -158,6 +160,61 @@ async def fetch_and_parse_wakeup(
     raise ValueError(f"无法获取 WakeUp 课表数据：{last_err}")
 
 
+def parse_week_spec_text(text: str) -> Tuple[Optional[int], Optional[int], int, List[int]]:
+    """
+    从描述文本中解析周数范围与单双周信息，例如：
+    - "第1-16周" -> (1, 16, 0, [1..16])
+    - "2-16周(双)" / "第2-16双周" -> (2, 16, 2, [2,4..16])
+    - "1-8,10-16周" -> (1, 16, 0, [1..8, 10..16])
+    - "第5周" -> (5, 5, 0, [5])
+    """
+    if not text:
+        return None, None, 0, []
+
+    # 匹配形如 "第1-8,10-16周(单)" 或 "周次: 1-18周" 或 "1-16周"
+    m_week_expr = re.search(
+        r"(?:第\s*)?(\d+(?:\s*[-~至到,，、]\s*\d+)*)\s*(?:([单双])\s*)?周(?:\s*[\(（]?\s*([单双])周?\s*[\)）]?)?",
+        text,
+    )
+    if not m_week_expr:
+        return None, None, 0, []
+
+    raw_body = m_week_expr.group(1)
+    odd_even_tag = m_week_expr.group(2) or m_week_expr.group(3) or ""
+    if not odd_even_tag:
+        if "单周" in text:
+            odd_even_tag = "单"
+        elif "双周" in text:
+            odd_even_tag = "双"
+
+    week_type = 1 if odd_even_tag == "单" else (2 if odd_even_tag == "双" else 0)
+    active_weeks: List[int] = []
+
+    for seg in re.split(r"[,，、]+", raw_body):
+        seg = seg.strip()
+        if not seg:
+            continue
+        m_rng = re.match(r"^(\d+)\s*[-~至到]\s*(\d+)$", seg)
+        if m_rng:
+            w1, w2 = int(m_rng.group(1)), int(m_rng.group(2))
+            if 1 <= w1 <= w2 <= 40:
+                for w in range(w1, w2 + 1):
+                    if week_type == 1 and w % 2 == 0:
+                        continue
+                    if week_type == 2 and w % 2 == 1:
+                        continue
+                    active_weeks.append(w)
+        elif seg.isdigit():
+            w = int(seg)
+            if 1 <= w <= 40:
+                active_weeks.append(w)
+
+    active_weeks = sorted(set(active_weeks))
+    if not active_weeks:
+        return None, None, 0, []
+    return min(active_weeks), max(active_weeks), week_type, active_weeks
+
+
 def parse_wakeup_raw_data(raw_data: str, tz_name: str = "Asia/Shanghai") -> ScheduleData:
     """解析 WakeUp 的 5 行 JSON 格式 (.wakeup_schedule) 或单 JSON 格式"""
     lines = [line.strip() for line in raw_data.strip().splitlines() if line.strip()]
@@ -171,39 +228,56 @@ def parse_wakeup_raw_data(raw_data: str, tz_name: str = "Asia/Shanghai") -> Sche
     if len(lines) < 5:
         raise ValueError("WakeUp 课表数据格式不完整（少于 5 个数据段）。")
 
-    # Line 0: base config
-    # Line 1: time slots array
-    # Line 2: table config (startDate, maxWeek, nodes, tableName, sundayFirst)
-    # Line 3: course meta array (id, courseName, color)
-    # Line 4: course details array (id, day, startNode, step, startWeek, endWeek, type, room, teacher)
     time_list_raw = json.loads(lines[1])
     table_cfg = json.loads(lines[2])
     course_meta_list = json.loads(lines[3])
     course_detail_list = json.loads(lines[4])
 
-    time_slots: List[TimeSlot] = []
-    time_map: Dict[int, TimeSlot] = {}
-    for item in time_list_raw:
-        node = int(item.get("node", 0))
-        st = str(item.get("startTime", "08:00")).strip()
-        et = str(item.get("endTime", "08:45")).strip()
-        if node >= 1 and st and et and st != "00:00":
-            slot = TimeSlot(node=node, start_time=st, end_time=et)
-            if node not in time_map:
-                time_map[node] = slot
-                time_slots.append(slot)
-
-    if not time_slots:
-        time_slots = [TimeSlot.from_dict(x) for x in DEFAULT_TIME_SLOTS]
-        time_map = {s.node: s for s in time_slots}
-    else:
-        time_slots.sort(key=lambda x: x.node)
-
     raw_start_date = str(table_cfg.get("startDate", "2026-09-07")).strip()
     start_date_str = _normalize_date_str(raw_start_date)
-    max_week = max(1, int(table_cfg.get("maxWeek", 20)))
-    max_nodes = max(1, int(table_cfg.get("nodes", 12)))
+    cfg_max_week = max(1, int(table_cfg.get("maxWeek", 20)))
+    cfg_max_nodes = max(1, int(table_cfg.get("nodes", 12)))
     table_name = str(table_cfg.get("tableName") or "WakeUp课表").strip()
+
+    # 计算实际课程涉及的最大节次
+    max_course_node = 0
+    for d in course_detail_list:
+        sn = max(1, int(d.get("startNode", 1)))
+        st = max(1, int(d.get("step", 1)))
+        if sn + st - 1 > max_course_node:
+            max_course_node = sn + st - 1
+    effective_max_nodes = max(cfg_max_nodes, max_course_node)
+
+    # 过滤 WakeUp 中未配置的占位节次（例如超过 nodes 后重置为 08:00-08:45 或 00:00-00:00 的无效项）
+    time_slots: List[TimeSlot] = []
+    time_map: Dict[int, TimeSlot] = {}
+    last_end_min = -1
+    for item in sorted(time_list_raw, key=lambda x: int(x.get("node", 0))):
+        node = int(item.get("node", 0))
+        st = str(item.get("startTime", "")).strip()
+        et = str(item.get("endTime", "")).strip()
+        if node < 1 or node > effective_max_nodes or not st or not et or st == "00:00":
+            continue
+        st_m = hhmm_to_minutes(st)
+        et_m = hhmm_to_minutes(et)
+        if et_m <= st_m:
+            continue
+        if last_end_min >= 0 and st_m < last_end_min:
+            continue
+        slot = TimeSlot(node=node, start_time=st, end_time=et)
+        if node not in time_map:
+            time_map[node] = slot
+            time_slots.append(slot)
+            last_end_min = et_m
+
+    if not time_slots:
+        time_slots = [
+            TimeSlot.from_dict(x)
+            for x in DEFAULT_TIME_SLOTS[: min(effective_max_nodes, len(DEFAULT_TIME_SLOTS))]
+        ]
+        time_map = {s.node: s for s in time_slots}
+
+    unit_mins, break_mins = infer_unit_and_break_minutes([], time_slots)
 
     meta_by_id: Dict[int, Dict[str, Any]] = {}
     for m in course_meta_list:
@@ -211,6 +285,7 @@ def parse_wakeup_raw_data(raw_data: str, tz_name: str = "Asia/Shanghai") -> Sche
         meta_by_id[cid] = m
 
     courses: List[CourseRule] = []
+    max_observed_week = cfg_max_week
     for idx, d in enumerate(course_detail_list):
         cid = int(d.get("id", -1))
         meta = meta_by_id.get(cid, {})
@@ -234,24 +309,33 @@ def parse_wakeup_raw_data(raw_data: str, tz_name: str = "Asia/Shanghai") -> Sche
             end_time = str(d["endTime"]).strip()
         else:
             st_slot = time_map.get(start_node)
-            et_slot = time_map.get(end_node) or time_map.get(start_node)
-            start_time = st_slot.start_time if st_slot else "08:00"
-            if et_slot and end_node in time_map:
+            et_slot = time_map.get(end_node)
+            if st_slot:
+                start_time = st_slot.start_time
+            elif time_slots:
+                first_s = time_slots[0]
+                st_m = hhmm_to_minutes(first_s.start_time) + (start_node - first_s.node) * (
+                    unit_mins + break_mins
+                )
+                start_time = minutes_to_hhmm(st_m)
+            else:
+                start_time = "08:00"
+
+            if et_slot:
                 end_time = et_slot.end_time
             else:
-                # 根据每节 45 分钟 + 课间 5 分钟推算
-                t_parts = [int(p) for p in start_time.split(":")]
-                mins = t_parts[0] * 60 + t_parts[1] + step * 45 + max(0, step - 1) * 5
-                end_time = f"{(mins // 60) % 24:02d}:{mins % 60:02d}"
+                st_m = hhmm_to_minutes(start_time)
+                et_m = st_m + step * unit_mins + max(0, step - 1) * break_mins
+                end_time = minutes_to_hhmm(et_m)
 
         start_week = max(1, int(d.get("startWeek", 1)))
-        end_week = max(start_week, int(d.get("endWeek", max_week)))
+        end_week = max(start_week, int(d.get("endWeek", cfg_max_week)))
         week_type = int(d.get("type", 0))  # 0=全周, 1=单周, 2=双周
+        if end_week > max_observed_week:
+            max_observed_week = end_week
+
         room = str(d.get("room") or "").strip()
         teacher = str(d.get("teacher") or "").strip()
-
-        if end_node > max_nodes:
-            max_nodes = end_node
 
         courses.append(
             CourseRule(
@@ -274,8 +358,8 @@ def parse_wakeup_raw_data(raw_data: str, tz_name: str = "Asia/Shanghai") -> Sche
         source_type="wakeup",
         table_name=table_name,
         start_date=start_date_str,
-        max_week=max_week,
-        max_nodes=max_nodes,
+        max_week=max_observed_week,
+        max_nodes=effective_max_nodes,
         time_slots=time_slots,
         courses=courses,
         updated_at=now_in_tz(tz_name).strftime("%Y-%m-%d %H:%M:%S"),
@@ -286,33 +370,54 @@ def parse_wakeup_dict_data(data: Dict[str, Any], tz_name: str = "Asia/Shanghai")
     """解析单字典结构的 WakeUp 课表 JSON"""
     start_date_str = _normalize_date_str(str(data.get("startDate", "2026-09-07")))
     table_name = str(data.get("tableName") or "WakeUp课表")
-    max_week = int(data.get("maxWeek", 20))
-    max_nodes = int(data.get("nodes", 12))
+    cfg_max_week = max(1, int(data.get("maxWeek", 20)))
+    cfg_max_nodes = max(1, int(data.get("nodes", 12)))
 
     raw_times = data.get("timeList") or DEFAULT_TIME_SLOTS
     time_slots = [TimeSlot.from_dict(t) for t in raw_times]
     time_map = {s.node: s for s in time_slots}
+    unit_mins, break_mins = infer_unit_and_break_minutes([], time_slots)
 
     courses: List[CourseRule] = []
+    max_observed_week = cfg_max_week
+    max_observed_node = cfg_max_nodes
+
     for idx, item in enumerate(data.get("courseList", [])):
         course_name = str(item.get("courseName", f"课程{idx + 1}")).strip()
         day = int(item.get("day", 1))
-        start_node = int(item.get("startNode", 1))
+        if day == 0:
+            day = 7
+        start_node = max(1, int(item.get("startNode", 1)))
         step = max(1, int(item.get("step", 2)))
         end_node = start_node + step - 1
+        if end_node > max_observed_node:
+            max_observed_node = end_node
+
         st_slot = time_map.get(start_node)
         et_slot = time_map.get(end_node)
         start_time = str(item.get("startTime") or (st_slot.start_time if st_slot else "08:00"))
-        end_time = str(item.get("endTime") or (et_slot.end_time if et_slot else "09:35"))
-        start_week = int(item.get("startWeek", 1))
-        end_week = int(item.get("endWeek", max_week))
-        week_type = int(item.get("type", 0))
+        if item.get("endTime"):
+            end_time = str(item["endTime"])
+        elif et_slot:
+            end_time = et_slot.end_time
+        else:
+            st_m = hhmm_to_minutes(start_time)
+            end_time = minutes_to_hhmm(st_m + step * unit_mins + max(0, step - 1) * break_mins)
 
-        # 兼容 stepWeekList
+        start_week = max(1, int(item.get("startWeek", 1)))
+        end_week = max(start_week, int(item.get("endWeek", cfg_max_week)))
+        week_type = int(item.get("type", 0))
+        active_weeks: List[int] = []
+
         step_weeks = item.get("stepWeekList")
         if isinstance(step_weeks, list) and step_weeks:
-            start_week = min(int(w) for w in step_weeks)
-            end_week = max(int(w) for w in step_weeks)
+            active_weeks = sorted({int(w) for w in step_weeks if int(w) >= 1})
+            if active_weeks:
+                start_week = min(active_weeks)
+                end_week = max(active_weeks)
+
+        if end_week > max_observed_week:
+            max_observed_week = end_week
 
         courses.append(
             CourseRule(
@@ -327,6 +432,7 @@ def parse_wakeup_dict_data(data: Dict[str, Any], tz_name: str = "Asia/Shanghai")
                 start_week=start_week,
                 end_week=end_week,
                 week_type=week_type,
+                active_weeks=active_weeks,
                 color=pick_course_color(course_name, idx),
             )
         )
@@ -335,8 +441,8 @@ def parse_wakeup_dict_data(data: Dict[str, Any], tz_name: str = "Asia/Shanghai")
         source_type="wakeup",
         table_name=table_name,
         start_date=start_date_str,
-        max_week=max_week,
-        max_nodes=max_nodes,
+        max_week=max_observed_week,
+        max_nodes=max_observed_node,
         time_slots=time_slots,
         courses=courses,
         updated_at=now_in_tz(tz_name).strftime("%Y-%m-%d %H:%M:%S"),
@@ -425,43 +531,78 @@ def _parse_ics_duration(dur_str: str) -> timedelta:
 
 def _extract_meta_from_ics_fields(
     summary: str, location: str, description: str
-) -> Tuple[str, str, str, Optional[int], Optional[int]]:
-    """从 SUMMARY / LOCATION / DESCRIPTION 中智能提取 (课程名, 教室, 教师, 起始节, 节数)"""
+) -> Tuple[str, str, str, Optional[int], Optional[int], Optional[int], Optional[int], int, List[int]]:
+    """
+    从 SUMMARY / LOCATION / DESCRIPTION 中智能提取：
+    (课程名, 教室, 教师, 起始节, 节数, 起始周, 结束周, 单双周类型, 活跃周列表)
+    """
     course_name = summary.strip()
     room = location.strip()
     teacher = ""
     start_node: Optional[int] = None
     step: Optional[int] = None
+    start_week: Optional[int] = None
+    end_week: Optional[int] = None
+    week_type: int = 0
+    active_weeks: List[int] = []
 
-    # 如果 SUMMARY 包含 @教室，如 "高等数学@教三-201"
     if "@" in course_name and not room:
         parts = course_name.split("@", 1)
         course_name = parts[0].strip()
         room = parts[1].strip()
 
+    combined_text = f"{summary}\n{description}"
+    w_min, w_max, w_type, w_list = parse_week_spec_text(combined_text)
+    if w_min is not None and w_max is not None:
+        start_week = w_min
+        end_week = w_max
+        week_type = w_type
+        active_weeks = w_list
+
     if description:
         desc_lines = [ln.strip() for ln in description.splitlines() if ln.strip()]
         for ln in desc_lines:
-            # 匹配节次：如 "第1 - 2节" 或 "第3-4节" 或 "1-2节"
-            m_node = re.search(r"第?\s*(\d+)\s*[-~至到]\s*(\d+)\s*节", ln)
+            # 匹配节次范围：如 "第1 - 2节"、"第3-5节"、"1-2节"、"节次: 03-04"
+            m_node = re.search(r"第?\s*(\d+)\s*[-~至到－—]\s*(\d+)\s*节", ln)
+            if not m_node:
+                m_node = re.search(r"(?:节次|节数)[：:\s]*第?\s*(\d+)\s*[-~至到－—]\s*(\d+)", ln)
             if m_node:
                 n1, n2 = int(m_node.group(1)), int(m_node.group(2))
-                if 1 <= n1 <= n2 <= 20:
+                if 1 <= n1 <= n2 <= 25:
                     start_node = n1
                     step = n2 - n1 + 1
                 continue
-            m_single = re.search(r"第\s*(\d+)\s*节", ln)
-            if m_single and start_node is None:
-                start_node = int(m_single.group(1))
-                step = 1
+
+            # 匹配逗号/顿号分隔节次：如 "第1,2节"、"第3、4、5节"
+            m_list_node = re.search(r"第?\s*(\d+(?:\s*[,，、]\s*\d+)+)\s*节", ln)
+            if m_list_node:
+                nums = [
+                    int(x.strip())
+                    for x in re.split(r"[,，、]", m_list_node.group(1))
+                    if x.strip().isdigit()
+                ]
+                if nums and 1 <= min(nums) <= max(nums) <= 25:
+                    start_node = min(nums)
+                    step = max(nums) - min(nums) + 1
                 continue
 
-            # 匹配教师/教室键值对
-            m_teacher = re.match(r"^(?:教师|老师|任课教师|授课教师|Teacher)[：:\s]+(.+)$", ln, re.I)
+            m_single = re.search(r"第\s*(\d+)\s*节", ln)
+            if m_single and start_node is None:
+                n1 = int(m_single.group(1))
+                if 1 <= n1 <= 25:
+                    start_node = n1
+                    step = 1
+                continue
+
+            m_teacher = re.match(
+                r"^(?:教师|老师|任课教师|授课教师|Teacher)[：:\s]+(.+)$", ln, re.I
+            )
             if m_teacher:
                 teacher = m_teacher.group(1).strip()
                 continue
-            m_room = re.match(r"^(?:教室|地点|上课地点|位置|Location|Room)[：:\s]+(.+)$", ln, re.I)
+            m_room = re.match(
+                r"^(?:教室|地点|上课地点|位置|Location|Room)[：:\s]+(.+)$", ln, re.I
+            )
             if m_room and not room:
                 room = m_room.group(1).strip()
                 continue
@@ -472,14 +613,24 @@ def _extract_meta_from_ics_fields(
             filtered = [
                 ln
                 for ln in desc_lines
-                if not re.search(r"第?\s*\d+.*节|周", ln) and ln != room
+                if not re.search(r"第?\s*\d+.*(?:节|周)", ln) and ln != room
             ]
             if filtered:
                 candidate = filtered[-1]
                 if len(candidate) <= 20:
                     teacher = candidate
 
-    return course_name, room, teacher, start_node, step
+    return (
+        course_name,
+        room,
+        teacher,
+        start_node,
+        step,
+        start_week,
+        end_week,
+        week_type,
+        active_weeks,
+    )
 
 
 def _expand_rrule_dates(
@@ -558,7 +709,11 @@ def parse_ics_content(
     tz_name: str = "Asia/Shanghai",
     table_name: str = "ICS日历课表",
 ) -> ScheduleData:
-    """解析 .ics 日历文本为统一的 ScheduleData（内置完整 RFC 5545 解析并自动转换时区）"""
+    """
+    解析 .ics 日历文本为统一的 ScheduleData：
+    - 动态根据课表事件提取每节课的开始时间、结束时间、课程时长与每节课间隙，生成专属 time_slots
+    - 动态根据课表事件日期与周数描述确定学期第一周周一与每个人的总周数 (max_week) 及各门课的上课周数
+    """
     if "BEGIN:VCALENDAR" not in ics_text.upper():
         raise ValueError("无效的 .ics 文件内容（缺少 BEGIN:VCALENDAR）。")
 
@@ -596,19 +751,18 @@ def parse_ics_content(
                 params[pk.strip().upper()] = pv.strip().strip('"')
 
         if not in_event:
-            if prop_name in ("X-WR-CALNAME", "PRODID") and prop_name == "X-WR-CALNAME":
-                if val_part.strip():
-                    cal_name = _unescape_ics_text(val_part)
+            if prop_name == "X-WR-CALNAME" and val_part.strip():
+                cal_name = _unescape_ics_text(val_part)
         else:
             current_props.append((prop_name, params, val_part))
 
     if not raw_events:
         raise ValueError(".ics 文件中未找到任何课程事件 (VEVENT)。")
 
-    # 聚合相同 (课程名, 星期, start_time, end_time, 教室, 教师) 的日期
-    grouped_rules: Dict[Tuple[str, int, str, str, str, str], Dict[str, Any]] = {}
-    all_dates: List[date] = []
-    max_nodes = 12
+    # 第一遍扫描：提取所有 VEVENT 的时间、显式节次、显式周数、重复日期
+    parsed_events: List[Dict[str, Any]] = []
+    explicit_spans: List[Tuple[int, int, int, int]] = []
+    unnumbered_intervals: List[Tuple[int, int]] = []
 
     for props in raw_events:
         summary = ""
@@ -652,19 +806,27 @@ def parse_ics_content(
         if dtend <= dtstart:
             dtend = dtstart + timedelta(minutes=90)
 
-        course_name, room, teacher, start_node, step = _extract_meta_from_ics_fields(
-            summary, location, description
-        )
+        (
+            course_name,
+            room,
+            teacher,
+            start_node,
+            step,
+            exp_start_week,
+            exp_end_week,
+            exp_week_type,
+            exp_active_weeks,
+        ) = _extract_meta_from_ics_fields(summary, location, description)
+
         start_hhmm = dtstart.strftime("%H:%M")
         end_hhmm = dtend.strftime("%H:%M")
+        s_min = hhmm_to_minutes(start_hhmm)
+        e_min = hhmm_to_minutes(end_hhmm)
 
-        if start_node is None or step is None:
-            inferred_start, inferred_step = infer_nodes_from_time(start_hhmm, end_hhmm)
-            start_node = start_node or inferred_start
-            step = step or inferred_step
-
-        if start_node + step - 1 > max_nodes:
-            max_nodes = start_node + step - 1
+        if start_node is not None and step is not None and e_min > s_min:
+            explicit_spans.append((start_node, step, s_min, e_min))
+        elif e_min > s_min:
+            unnumbered_intervals.append((s_min, e_min))
 
         if rrule_str:
             occ_dates = _expand_rrule_dates(dtstart, rrule_str, exdates, tz_name)
@@ -672,41 +834,151 @@ def parse_ics_content(
             d_str = dtstart.date().isoformat()
             occ_dates = [] if d_str in exdates else [dtstart.date()]
 
+        parsed_events.append(
+            {
+                "course_name": course_name,
+                "room": room,
+                "teacher": teacher,
+                "start_hhmm": start_hhmm,
+                "end_hhmm": end_hhmm,
+                "start_node": start_node,
+                "step": step,
+                "exp_start_week": exp_start_week,
+                "exp_end_week": exp_end_week,
+                "exp_week_type": exp_week_type,
+                "exp_active_weeks": exp_active_weeks,
+                "has_rrule": bool(rrule_str),
+                "occ_dates": occ_dates,
+            }
+        )
+
+    if not parsed_events:
+        raise ValueError("未能从 .ics 文件中解析出有效课程。")
+
+    # 若存在未标注“第X-Y节”的事件，先基于已知事件或全量时间段构建初步动态节次表用于推断节次
+    if explicit_spans:
+        temp_rules = [
+            CourseRule(
+                course_name="tmp",
+                start_node=sn,
+                step=st,
+                start_time=minutes_to_hhmm(sm),
+                end_time=minutes_to_hhmm(em),
+            )
+            for sn, st, sm, em in explicit_spans
+        ]
+        prelim_slots, _ = build_dynamic_time_slots_from_courses(
+            temp_rules, force_from_courses=True
+        )
+        unit_mins, break_mins = infer_unit_and_break_minutes(explicit_spans, prelim_slots)
+    else:
+        prelim_slots, unit_mins, break_mins = build_slots_for_unnumbered_events(
+            unnumbered_intervals
+        )
+
+    prelim_slot_dicts = [s.to_dict() for s in prelim_slots]
+
+    # 聚合相同 (课程名, 星期, start_time, end_time, 教室, 教师) 的事件
+    grouped_rules: Dict[Tuple[str, int, str, str, str, str], Dict[str, Any]] = {}
+    all_dates: List[date] = []
+    anchored_mondays: List[date] = []
+
+    for ev in parsed_events:
+        start_node = ev["start_node"]
+        step = ev["step"]
+        if start_node is None or step is None:
+            inferred_start, inferred_step = infer_nodes_from_time(
+                ev["start_hhmm"],
+                ev["end_hhmm"],
+                time_slots=prelim_slot_dicts,
+                unit_mins=unit_mins,
+                break_mins=break_mins,
+            )
+            start_node = start_node or inferred_start
+            step = step or inferred_step
+
+        occ_dates: List[date] = ev["occ_dates"]
+        if occ_dates and ev["exp_start_week"] and ev["exp_start_week"] >= 1:
+            first_d = min(occ_dates)
+            first_mon = first_d - timedelta(days=first_d.isoweekday() - 1)
+            anchored_mondays.append(first_mon - timedelta(weeks=ev["exp_start_week"] - 1))
+
         for occ_d in occ_dates:
             all_dates.append(occ_d)
             wd = occ_d.isoweekday()
-            gkey = (course_name, wd, start_hhmm, end_hhmm, room, teacher)
+            gkey = (
+                ev["course_name"],
+                wd,
+                ev["start_hhmm"],
+                ev["end_hhmm"],
+                ev["room"],
+                ev["teacher"],
+            )
             if gkey not in grouped_rules:
                 grouped_rules[gkey] = {
-                    "course_name": course_name,
-                    "teacher": teacher,
-                    "room": room,
+                    "course_name": ev["course_name"],
+                    "teacher": ev["teacher"],
+                    "room": ev["room"],
                     "weekday": wd,
                     "start_node": start_node,
                     "step": step,
-                    "start_time": start_hhmm,
-                    "end_time": end_hhmm,
+                    "start_time": ev["start_hhmm"],
+                    "end_time": ev["end_hhmm"],
                     "dates": set(),
+                    "exp_start_week": ev["exp_start_week"],
+                    "exp_end_week": ev["exp_end_week"],
+                    "exp_week_type": ev["exp_week_type"],
+                    "exp_active_weeks": list(ev["exp_active_weeks"] or []),
+                    "has_rrule": ev["has_rrule"],
                 }
+            else:
+                if ev["exp_active_weeks"]:
+                    merged_w = set(grouped_rules[gkey]["exp_active_weeks"]) | set(
+                        ev["exp_active_weeks"]
+                    )
+                    grouped_rules[gkey]["exp_active_weeks"] = sorted(merged_w)
             grouped_rules[gkey]["dates"].add(occ_d.isoformat())
 
     if not grouped_rules:
         raise ValueError("未能从 .ics 文件中解析出有效课程。")
 
     earliest_date = min(all_dates) if all_dates else date.today()
-    semester_monday = earliest_date - timedelta(days=earliest_date.isoweekday() - 1)
-    latest_date = max(all_dates) if all_dates else earliest_date
-    total_weeks = max(20, ((latest_date - semester_monday).days // 7) + 1)
+    default_monday = earliest_date - timedelta(days=earliest_date.isoweekday() - 1)
+    if anchored_mondays:
+        semester_monday = min(anchored_mondays)
+    else:
+        semester_monday = default_monday
 
     courses: List[CourseRule] = []
+    max_observed_week = 1
+
     for idx, (_, info) in enumerate(grouped_rules.items()):
         sorted_dates = sorted(info["dates"])
-        week_nums = [
-            ((date.fromisoformat(ds) - semester_monday).days // 7) + 1
-            for ds in sorted_dates
-        ]
-        min_w = max(1, min(week_nums)) if week_nums else 1
-        max_w = max(min_w, max(week_nums)) if week_nums else 20
+        date_week_nums = sorted(
+            {
+                ((date.fromisoformat(ds) - semester_monday).days // 7) + 1
+                for ds in sorted_dates
+                if ((date.fromisoformat(ds) - semester_monday).days // 7) + 1 >= 1
+            }
+        )
+
+        exp_weeks: List[int] = sorted(set(info.get("exp_active_weeks") or []))
+        # 若该课程在 ICS 中仅有单个日期（无 RRULE）但 DESCRIPTION 明确声明了多周（如 "1-16周"），则展开到对应周数
+        if len(sorted_dates) == 1 and not info["has_rrule"] and len(exp_weeks) > 1:
+            active_weeks = exp_weeks
+            min_w = min(active_weeks)
+            max_w = max(active_weeks)
+            week_type = int(info.get("exp_week_type") or 0)
+            specific_dates_to_store: List[str] = []
+        else:
+            active_weeks = date_week_nums or exp_weeks or [1]
+            min_w = max(1, min(active_weeks))
+            max_w = max(min_w, max(active_weeks))
+            week_type = int(info.get("exp_week_type") or 0)
+            specific_dates_to_store = sorted_dates
+
+        if max_w > max_observed_week:
+            max_observed_week = max_w
 
         courses.append(
             CourseRule(
@@ -720,19 +992,27 @@ def parse_ics_content(
                 end_time=info["end_time"],
                 start_week=min_w,
                 end_week=max_w,
-                week_type=0,
-                specific_dates=sorted_dates,
+                week_type=week_type,
+                active_weeks=active_weeks,
+                specific_dates=specific_dates_to_store,
                 color=pick_course_color(info["course_name"], idx),
             )
         )
+
+    dynamic_slots, dynamic_max_nodes = build_dynamic_time_slots_from_courses(
+        courses=courses,
+        existing_slots=prelim_slots,
+        preferred_max_nodes=0,
+        force_from_courses=True,
+    )
 
     return ScheduleData(
         source_type="ics",
         table_name=cal_name,
         start_date=semester_monday.isoformat(),
-        max_week=total_weeks,
-        max_nodes=max_nodes,
-        time_slots=[TimeSlot.from_dict(x) for x in DEFAULT_TIME_SLOTS],
+        max_week=max(1, max_observed_week),
+        max_nodes=dynamic_max_nodes,
+        time_slots=dynamic_slots,
         courses=courses,
         updated_at=now_in_tz(tz_name).strftime("%Y-%m-%d %H:%M:%S"),
     )

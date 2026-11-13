@@ -21,6 +21,7 @@ from .models import (
     ScheduleData,
     UserProfile,
     format_duration_cn,
+    hhmm_to_minutes,
     now_in_tz,
     parse_hhmm,
 )
@@ -473,15 +474,18 @@ class ScheduleRenderer:
             course_line_h = 39
             course_lines = self._wrap_text_full(draw, c.course_name, f_course, inner_w)
 
-        # 教室与教师信息：合并或分行完整展示，绝不截断
+        # 教室、教师与周数信息：合并或分行完整展示，绝不截断
         f_meta = self._get_font(24, bold=True)
         meta_line_h = 34
         room_clean = strip_unsupported_chars(c.room) or "未指定"
         teacher_clean = strip_unsupported_chars(c.teacher)
+        week_clean = strip_unsupported_chars(getattr(c, "week_range_str", ""))
+        meta_parts = [f"教室 · {room_clean}"]
         if teacher_clean and teacher_clean not in room_clean:
-            full_meta_str = f"教室 · {room_clean}    教师 · {teacher_clean}"
-        else:
-            full_meta_str = f"教室 · {room_clean}"
+            meta_parts.append(f"教师 · {teacher_clean}")
+        if week_clean:
+            meta_parts.append(f"周数 · {week_clean}")
+        full_meta_str = "    ".join(meta_parts)
 
         pill_inner_max_w = inner_w - 28
         meta_lines = self._wrap_text_full(draw, full_meta_str, f_meta, pill_inner_max_w)
@@ -787,7 +791,12 @@ class ScheduleRenderer:
             bold_stroke=True,
         )
 
-        date_txt = f"{target_date.strftime('%m月%d日')} {weekday_str} · 第 {week_num} 周"
+        week_label = (
+            f"第 {week_num}/{schedule.max_week} 周"
+            if schedule.max_week > 0
+            else f"第 {week_num} 周"
+        )
+        date_txt = f"{target_date.strftime('%m月%d日')} {weekday_str} · {week_label}"
         self._draw_text(
             draw, (hx1 + 144, hy1 + 84), date_txt, (199, 210, 254), f_hero_sub
         )
@@ -916,6 +925,7 @@ class ScheduleRenderer:
         c: CourseInstance,
         inner_w: int,
         avail_h: int,
+        custom_time_str: str = "",
     ) -> Dict[str, Any]:
         """
         为周课表单元格自动选择最佳字号并完整换行（不截断任何课程名、教室与教师）：
@@ -931,6 +941,9 @@ class ScheduleRenderer:
             meta_str = teacher_clean
         else:
             meta_str = ""
+
+        if custom_time_str:
+            meta_str = f"{custom_time_str} {meta_str}".strip()
 
         size_candidates = [
             (21, 17, 25, 21),
@@ -1001,11 +1014,30 @@ class ScheduleRenderer:
             )
             return out_path
 
-        max_nodes = max(12, schedule.max_nodes)
-        for day_list in week_courses.values():
-            for c in day_list:
-                if c.end_node > max_nodes:
-                    max_nodes = c.end_node
+        max_course_node = max(
+            (c.end_node for dlist in week_courses.values() for c in dlist),
+            default=0,
+        )
+        all_sched_node = max(
+            (c.start_node + max(1, c.step) - 1 for c in schedule.courses),
+            default=0,
+        )
+        max_nodes = max(4, schedule.max_nodes, max_course_node, all_sched_node)
+        slot_map = {s.node: s for s in schedule.time_slots}
+        default_map = {s["node"]: s for s in DEFAULT_TIME_SLOTS}
+
+        def _get_custom_time_tag(c: CourseInstance) -> str:
+            s_node = max(1, min(max_nodes, c.start_node))
+            e_node = max(s_node, min(max_nodes, c.end_node))
+            s_slot = slot_map.get(s_node)
+            e_slot = slot_map.get(e_node)
+            if not s_slot or not e_slot:
+                return f"{c.start_time}-{c.end_time}"
+            st_diff = abs(hhmm_to_minutes(c.start_time) - hhmm_to_minutes(s_slot.start_time))
+            et_diff = abs(hhmm_to_minutes(c.end_time) - hhmm_to_minutes(e_slot.end_time))
+            if st_diff > 1 or et_diff > 1:
+                return f"{c.start_time}-{c.end_time}"
+            return ""
 
         # 完整展示周一至周日 7 列（让周六、周日课程始终清晰可见）
         num_days = 7
@@ -1027,7 +1059,7 @@ class ScheduleRenderer:
                 span = max(1, c.end_node - c.start_node + 1)
                 avail_h = span * row_h - 26
                 plan = self._fit_weekly_cell_content(
-                    dummy_draw, c, inner_cell_w, avail_h
+                    dummy_draw, c, inner_cell_w, avail_h, _get_custom_time_tag(c)
                 )
                 if plan["needed_h"] > avail_h:
                     req_row_h = int((plan["needed_h"] + 30) / span) + 2
@@ -1065,7 +1097,12 @@ class ScheduleRenderer:
         total_wk_nodes = sum(c.step for c in all_wk_instances)
         total_wk_hours = round(sum(c.duration_minutes for c in all_wk_instances) / 60.0, 1)
 
-        head_raw = f"{display_name} · {title_prefix}（第 {week_num} 周）"
+        week_badge = (
+            f"第 {week_num}/{schedule.max_week} 周"
+            if schedule.max_week > 0
+            else f"第 {week_num} 周"
+        )
+        head_raw = f"{display_name} · {title_prefix}（{week_badge}）"
         f_hero_title, _ = self._fit_single_line_font(
             draw, head_raw, (hx2 - hx1) - 180, start_size=34, min_size=20, bold=True
         )
@@ -1139,16 +1176,23 @@ class ScheduleRenderer:
                 draw, (cx1 + (col_w - w2) // 2, grid_top + 46), dt_txt, fg2, f_col_dt
             )
 
-        slot_map = {s.node: s for s in schedule.time_slots}
-        default_map = {s["node"]: s for s in DEFAULT_TIME_SLOTS}
-
         for node in range(1, max_nodes + 1):
             ry1 = body_top + (node - 1) * row_h
-            draw.line((pad_x, ry1, width - pad_x, ry1), fill=(226, 232, 240), width=1)
-
             slot = slot_map.get(node)
+            prev_slot = slot_map.get(node - 1) if node > 1 else None
             st_str = slot.start_time if slot else default_map.get(node, {}).get("start_time", "")
             et_str = slot.end_time if slot else default_map.get(node, {}).get("end_time", "")
+
+            # 动态检测大课间/午休/晚休间隙（>= 25 分钟时加粗分割线提示）
+            is_big_break = False
+            if prev_slot and st_str and prev_slot.end_time:
+                gap_mins = hhmm_to_minutes(st_str) - hhmm_to_minutes(prev_slot.end_time)
+                if gap_mins >= 25:
+                    is_big_break = True
+
+            line_col = (199, 210, 254) if is_big_break else (226, 232, 240)
+            line_w = 2 if is_big_break else 1
+            draw.line((pad_x, ry1, width - pad_x, ry1), fill=line_col, width=line_w)
 
             n_str = f"{node}"
             nw, _ = self._text_size(draw, n_str, f_node_num)
@@ -1215,7 +1259,7 @@ class ScheduleRenderer:
                 cell_inner_w = (cx2 - cx1) - 14
                 cell_avail_h = (cy2 - cy1) - 18
                 plan = self._fit_weekly_cell_content(
-                    draw, c, cell_inner_w, cell_avail_h
+                    draw, c, cell_inner_w, cell_avail_h, _get_custom_time_tag(c)
                 )
 
                 ty = cy1 + 12
@@ -1300,8 +1344,11 @@ class ScheduleRenderer:
 
         for prof, sched, av_path in members_data:
             day_courses = sched.get_courses_for_date(target_date, now=now, tz_name=tz_name)
+            m_week = sched.get_week_number(target_date)
             ongoing_c = next((c for c in day_courses if c.status == "ongoing"), None)
             next_c = next((c for c in day_courses if c.status in ("next", "upcoming")), None)
+            thresh_str = getattr(prof, "early_eight_threshold", "08:00") or "08:00"
+            t_thresh = parse_hhmm(thresh_str)
 
             if is_tomorrow:
                 if day_courses:
@@ -1311,7 +1358,11 @@ class ScheduleRenderer:
                     box_bg = (239, 246, 255)
                     box_fg = (30, 58, 138)
                     total_nodes = sum(c.step for c in day_courses)
-                    early_str = " · 早八" if day_courses[0].start_time <= "08:30" else ""
+                    early_str = (
+                        " · 早八"
+                        if parse_hhmm(day_courses[0].start_time) <= t_thresh
+                        else ""
+                    )
                     pill_txt = f"明日 {len(day_courses)} 门 ({total_nodes}节){early_str}"
 
                     main_lines: List[str] = []
@@ -1322,7 +1373,7 @@ class ScheduleRenderer:
                             self._wrap_text_full(dummy_draw, item_str, f_main_line, inner_text_max_w)
                         )
                     sub_lines = [
-                        f"全天共计 {total_nodes} 节 · {format_duration_cn(sum(c.duration_minutes for c in day_courses))}"
+                        f"第{m_week}周 · 全天共 {total_nodes} 节 · {format_duration_cn(sum(c.duration_minutes for c in day_courses))}"
                     ]
                 else:
                     free_count += 1
@@ -1332,7 +1383,7 @@ class ScheduleRenderer:
                     box_fg = (6, 95, 70)
                     pill_txt = "明天全天无课"
                     main_lines = ["明日无任何课程安排"]
-                    sub_lines = ["全天自由活动 · 可放心约饭或游戏"]
+                    sub_lines = [f"第{m_week}周 · 全天自由活动 · 可放心约饭或游戏"]
             else:
                 if ongoing_c:
                     ongoing_count += 1
@@ -1587,6 +1638,7 @@ class ScheduleRenderer:
         for prof, sched, av_path in members_data:
             wk_map = sched.get_courses_for_week(monday, now=now, tz_name=tz_name)
             wk_courses = [c for dlist in wk_map.values() for c in dlist]
+            m_week = sched.get_week_number(monday)
             total_mins = sum(c.duration_minutes for c in wk_courses)
             total_nodes = sum(c.step for c in wk_courses)
             threshold_str = getattr(prof, "early_eight_threshold", "08:00") or "08:00"
@@ -1600,6 +1652,7 @@ class ScheduleRenderer:
                     "profile": prof,
                     "display_name": prof.get_display_name(group_id),
                     "avatar_path": av_path,
+                    "week_num": m_week,
                     "total_mins": total_mins,
                     "total_hours": round(total_mins / 60.0, 1),
                     "total_nodes": total_nodes,
@@ -1776,7 +1829,7 @@ class ScheduleRenderer:
             )
             hw, _ = self._text_size(draw, hours_str, f_hours)
 
-            nodes_str = f"共 {r['total_nodes']} 节 · {r['course_count']} 门课 · 早八 {r['early_count']} 次"
+            nodes_str = f"第{r['week_num']}周 · 共 {r['total_nodes']} 节 · {r['course_count']} 门课 · 早八 {r['early_count']} 次"
             avail_nodes_w = (width - pad_x - 24) - (pad_x + 148 + hw + 16)
             f_nodes_fit, fitted_sz = self._fit_single_line_font(
                 draw, nodes_str, avail_nodes_w, start_size=23, min_size=15, bold=True
