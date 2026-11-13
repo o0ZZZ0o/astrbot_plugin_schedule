@@ -387,7 +387,17 @@ class TestSchedulePlugin(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("07:00", res_push[0]["text"])
 
-        # 测试 /设置提醒时间 （分步回复 "20"）
+        # 测试 /课前提醒 独立开关 与 /设置提醒时间 （分步回复 "20"）
+        ev_rem_toggle = FakeQQOfficialEvent(
+            message_str="/课前提醒 开启",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_rem_toggle = await collect_gen(
+            self.plugin.cmd_toggle_class_reminder(ev_rem_toggle)
+        )
+        self.assertIn("已开启课前提醒", res_rem_toggle[0]["text"])
+
         ev_rem = FakeQQOfficialEvent(
             message_str="/设置提醒时间",
             member_openid="OPENID_USER_AAA11111111111111111",
@@ -404,6 +414,69 @@ class TestSchedulePlugin(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("提前 20 分钟", res_rem[0]["text"])
 
+        # 测试 /早八提醒、/设置早八提醒时间、/设置早八时间
+        ev_e8_thresh = FakeQQOfficialEvent(
+            message_str="/设置早八时间 08:15",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_e8_thresh = await collect_gen(
+            self.plugin.cmd_set_early_eight_threshold(ev_e8_thresh)
+        )
+        self.assertIn("08:15", res_e8_thresh[0]["text"])
+
+        ev_e8_time = FakeQQOfficialEvent(
+            message_str="/设置早八提醒时间 21:30",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_e8_time = await collect_gen(
+            self.plugin.cmd_set_early_eight_remind_time(ev_e8_time)
+        )
+        self.assertIn("21:30", res_e8_time[0]["text"])
+
+        ev_e8_toggle = FakeQQOfficialEvent(
+            message_str="/早八提醒 开启",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_e8_toggle = await collect_gen(
+            self.plugin.cmd_toggle_early_eight(ev_e8_toggle)
+        )
+        self.assertIn("已开启早八提醒", res_e8_toggle[0]["text"])
+
+        # 测试 /周日推送、/设置周日推送时间 与 /下周上课排行
+        ev_sun_time = FakeQQOfficialEvent(
+            message_str="/设置周日推送时间 20:00",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_sun_time = await collect_gen(
+            self.plugin.cmd_set_sunday_push_time(ev_sun_time)
+        )
+        self.assertIn("20:00", res_sun_time[0]["text"])
+
+        ev_sun_toggle = FakeQQOfficialEvent(
+            message_str="/周日推送 开启 20:00",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_sun_toggle = await collect_gen(
+            self.plugin.cmd_toggle_sunday_push(ev_sun_toggle)
+        )
+        self.assertIn("已开启周日下周上课情况推送", res_sun_toggle[0]["text"])
+
+        ev_next_rank = FakeQQOfficialEvent(
+            message_str="/下周上课排行",
+            member_openid="OPENID_USER_AAA11111111111111111",
+            group_openid="GROUP_OPENID_1001",
+        )
+        res_next_rank = await collect_gen(
+            self.plugin.cmd_next_week_ranking(ev_next_rank)
+        )
+        self.assertEqual(res_next_rank[0]["type"], "image")
+        self.assertTrue(Path(res_next_rank[0]["path"]).exists())
+
         # 测试 /查看设置
         ev_view_cfg = FakeQQOfficialEvent(
             message_str="/查看设置",
@@ -414,8 +487,11 @@ class TestSchedulePlugin(unittest.IsolatedAsyncioTestCase):
         self.assertIn("学霸小明", res_cfg[0]["text"])
         self.assertIn("07:00", res_cfg[0]["text"])
         self.assertIn("20 分钟", res_cfg[0]["text"])
+        self.assertIn("21:30", res_cfg[0]["text"])
+        self.assertIn("08:15", res_cfg[0]["text"])
+        self.assertIn("20:00", res_cfg[0]["text"])
 
-        # 测试定时推送与开课前提醒触发
+        # 测试定时推送、课前@提醒、早八前夜@提醒、周日下周上课情况图片推送
         tz = get_tz("Asia/Shanghai")
         # 1) 早上 07:05 触发每日课表推送
         triggered_morning = await self.plugin.run_scheduled_checks(
@@ -431,7 +507,8 @@ class TestSchedulePlugin(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(triggered_dup), 0)
 
-        # 2) 09:45（距离 10:00 的《大学物理实验》还有 15 分钟 <= 20 分钟）触发课前提醒
+        # 2) 09:45（距离 10:00 的《大学物理实验》还有 15 分钟 <= 20 分钟）触发课前提醒，并验证 QQ官方机器人 @某人 语法
+        self.ctx.sent_messages.clear()
         triggered_rem = await self.plugin.run_scheduled_checks(
             now=datetime(2026, 11, 13, 9, 45, tzinfo=tz)
         )
@@ -439,6 +516,29 @@ class TestSchedulePlugin(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(triggered_rem[0]["type"], "class_reminder")
         self.assertEqual(triggered_rem[0]["course_name"], "大学物理实验")
         self.assertIn("15 分钟", triggered_rem[0]["text"])
+        sent_plain_rem = self.ctx.sent_messages[-1]["chain"].chain[0].text
+        self.assertIn("<@OPENID_USER_AAA11111111111111111>", sent_plain_rem)
+
+        # 3) 2026-11-13 晚上 21:35（前一天晚上提醒第二天 2026-11-14 08:00 的《程序设计实践》早八课，并 @用户）
+        self.ctx.sent_messages.clear()
+        triggered_e8 = await self.plugin.run_scheduled_checks(
+            now=datetime(2026, 11, 13, 21, 35, tzinfo=tz)
+        )
+        self.assertEqual(len(triggered_e8), 1)
+        self.assertEqual(triggered_e8[0]["type"], "early_eight_reminder")
+        self.assertEqual(triggered_e8[0]["course_name"], "程序设计实践")
+        sent_plain_e8 = self.ctx.sent_messages[-1]["chain"].chain[0].text
+        self.assertIn("<@OPENID_USER_AAA11111111111111111>", sent_plain_e8)
+        self.assertIn("早八提醒", sent_plain_e8)
+
+        # 4) 2026-11-15（周日）晚上 20:05 触发周日下周上课情况图片自动推送
+        self.ctx.sent_messages.clear()
+        triggered_sun = await self.plugin.run_scheduled_checks(
+            now=datetime(2026, 11, 15, 20, 5, tzinfo=tz)
+        )
+        self.assertEqual(len(triggered_sun), 1)
+        self.assertEqual(triggered_sun[0]["type"], "sunday_next_week_push")
+        self.assertTrue(Path(triggered_sun[0]["image_path"]).exists())
 
     def test_pil_rendering_code_paths_with_mock_pil(self) -> None:
         """验证当 Pillow (PIL) 启用时，三种渲染样式的所有绘图分支均无语法或逻辑错误"""

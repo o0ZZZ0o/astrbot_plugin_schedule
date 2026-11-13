@@ -424,10 +424,23 @@ class UserProfile:
     daily_push_enabled: bool = False
     daily_push_time: str = "07:30"
     daily_push_umo: str = ""
-    reminder_minutes: int = 0  # 0 表示未开启，1-120 表示提前分钟数
+    reminder_enabled: bool = False  # 课前提醒独立开关
+    reminder_minutes: int = 15  # 提前提醒分钟数 (1-120)
     reminder_umo: str = ""
     last_daily_push_date: str = ""
     reminded_classes: List[str] = field(default_factory=list)
+    # 早八提醒配置（在有早八的前一天指定时间推送并 @用户）
+    early_eight_enabled: bool = False
+    early_eight_remind_time: str = "21:30"  # 前一天几点提醒，如 21:30
+    early_eight_threshold: str = "08:00"  # 几点及之前开始的课算早八，如 08:00
+    early_eight_umo: str = ""
+    last_early_eight_remind_date: str = ""
+    # 周日推送下周上课情况配置
+    sunday_push_enabled: bool = False
+    sunday_push_time: str = "20:00"  # 周日几点推送下周上课情况，如 20:00
+    sunday_push_umo: str = ""
+    sunday_push_group_id: str = ""
+    last_sunday_push_date: str = ""
 
     def get_display_name(self, group_id: Optional[str] = None) -> str:
         """优先返回群昵称，绝不直接暴露冗长的 OpenID 或纯 QQ 号"""
@@ -459,6 +472,14 @@ class UserProfile:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "UserProfile":
+        raw_rem_mins = int(data.get("reminder_minutes", 15))
+        if "reminder_enabled" in data:
+            rem_enabled = bool(data.get("reminder_enabled", False))
+        else:
+            rem_enabled = raw_rem_mins > 0
+        if raw_rem_mins <= 0:
+            raw_rem_mins = 15
+
         return cls(
             user_id=str(data.get("user_id", "")),
             qq_number=str(data.get("qq_number", "")),
@@ -471,8 +492,21 @@ class UserProfile:
             daily_push_enabled=bool(data.get("daily_push_enabled", False)),
             daily_push_time=str(data.get("daily_push_time", "07:30")),
             daily_push_umo=str(data.get("daily_push_umo", "")),
-            reminder_minutes=int(data.get("reminder_minutes", 0)),
+            reminder_enabled=rem_enabled,
+            reminder_minutes=raw_rem_mins,
             reminder_umo=str(data.get("reminder_umo", "")),
             last_daily_push_date=str(data.get("last_daily_push_date", "")),
             reminded_classes=list(data.get("reminded_classes", [])),
+            early_eight_enabled=bool(data.get("early_eight_enabled", False)),
+            early_eight_remind_time=str(data.get("early_eight_remind_time", "21:30")),
+            early_eight_threshold=str(data.get("early_eight_threshold", "08:00")),
+            early_eight_umo=str(data.get("early_eight_umo", "")),
+            last_early_eight_remind_date=str(
+                data.get("last_early_eight_remind_date", "")
+            ),
+            sunday_push_enabled=bool(data.get("sunday_push_enabled", False)),
+            sunday_push_time=str(data.get("sunday_push_time", "20:00")),
+            sunday_push_umo=str(data.get("sunday_push_umo", "")),
+            sunday_push_group_id=str(data.get("sunday_push_group_id", "")),
+            last_sunday_push_date=str(data.get("last_sunday_push_date", "")),
         )

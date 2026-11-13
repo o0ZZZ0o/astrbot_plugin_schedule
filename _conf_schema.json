@@ -21,12 +21,30 @@
     "description": "交互式会话等待超时时间（秒）",
     "type": "int",
     "default": 120,
-    "hint": "发送 /绑定课表、/设置每日推送、/设置提醒时间 后等待回复的超时秒数"
+    "hint": "发送 /绑定课表 等指令后等待回复的超时秒数"
   },
   "default_daily_push_time": {
-    "description": "默认每日推送时间（用户未单独配置但开启时的默认时间）",
+    "description": "默认每日课表推送时间",
     "type": "string",
     "default": "07:30",
     "hint": "格式为 HH:MM，如 07:30"
+  },
+  "default_early_eight_remind_time": {
+    "description": "默认早八前一天提醒时间",
+    "type": "string",
+    "default": "21:30",
+    "hint": "在有早八的前一天几点进行提醒，格式为 HH:MM，如 21:30"
+  },
+  "default_early_eight_threshold": {
+    "description": "默认早八课程判定时间（该时间及之前开始的课算作早八）",
+    "type": "string",
+    "default": "08:00",
+    "hint": "格式为 HH:MM，如 08:00 或 08:30"
+  },
+  "default_sunday_push_time": {
+    "description": "默认周日推送下周上课情况的时间",
+    "type": "string",
+    "default": "20:00",
+    "hint": "周日几点推送下周上课情况排行图，格式为 HH:MM，如 20:00"
   }
 }

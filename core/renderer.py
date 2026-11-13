@@ -22,6 +22,7 @@ from .models import (
     UserProfile,
     format_duration_cn,
     now_in_tz,
+    parse_hhmm,
 )
 from .storage import StorageManager, safe_filename
 
@@ -1551,7 +1552,7 @@ class ScheduleRenderer:
         return out_path
 
     # =========================================================================
-    # 样式三：本周上课排行榜（黑金荣耀榜，自适应字号完整显示“早八 X 次”等全部信息）
+    # 样式三：本周/下周上课排行榜（黑金荣耀榜，支持本周与周日下周上课情况推送）
     # =========================================================================
     def render_weekly_ranking(
         self,
@@ -1559,11 +1560,16 @@ class ScheduleRenderer:
         group_id: Optional[str] = None,
         now: Optional[datetime] = None,
         tz_name: str = "Asia/Shanghai",
+        target_monday: Optional[date] = None,
+        title_text: str = "本周群友上课排行榜",
     ) -> Path:
         if now is None:
             now = now_in_tz(tz_name)
-        today = now.date()
-        monday = today - timedelta(days=today.isoweekday() - 1)
+        if target_monday is not None:
+            monday = target_monday - timedelta(days=target_monday.isoweekday() - 1)
+        else:
+            today = now.date()
+            monday = today - timedelta(days=today.isoweekday() - 1)
         sunday = monday + timedelta(days=6)
 
         out_path = (
@@ -1583,7 +1589,11 @@ class ScheduleRenderer:
             wk_courses = [c for dlist in wk_map.values() for c in dlist]
             total_mins = sum(c.duration_minutes for c in wk_courses)
             total_nodes = sum(c.step for c in wk_courses)
-            early_count = sum(1 for c in wk_courses if c.start_time <= "08:30")
+            threshold_str = getattr(prof, "early_eight_threshold", "08:00") or "08:00"
+            t_thresh = parse_hhmm(threshold_str)
+            early_count = sum(
+                1 for c in wk_courses if parse_hhmm(c.start_time) <= t_thresh
+            )
 
             ranking_rows.append(
                 {
@@ -1637,7 +1647,7 @@ class ScheduleRenderer:
         )
 
         self._draw_text(
-            draw, (hx1 + 28, hy1 + 28), "本周群友上课排行榜", (255, 255, 255), f_hero_title, bold_stroke=True
+            draw, (hx1 + 28, hy1 + 28), title_text, (255, 255, 255), f_hero_title, bold_stroke=True
         )
         sub_str = f"统计周期：{monday.strftime('%m月%d日')} - {sunday.strftime('%m月%d日')}（周一至周日）"
         self._draw_text(draw, (hx1 + 28, hy1 + 84), sub_str, (253, 230, 138), f_hero_sub)
