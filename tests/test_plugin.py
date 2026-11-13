@@ -549,6 +549,72 @@ class TestSchedulePlugin(unittest.IsolatedAsyncioTestCase):
             for p in (p1, p2, p3, p4, p5):
                 self.assertTrue(p.exists())
                 self.assertGreater(p.stat().st_size, 60)
+
+            # 验证超长课程名与教室名换行完整无截断，且周六/周日课程在周课表中正常获取
+            long_course_wu = parse_wakeup_raw_data(
+                "\n".join(
+                    [
+                        json.dumps({"courseLen": 45}),
+                        json.dumps(
+                            [
+                                {"node": 1, "startTime": "08:00", "endTime": "08:45"},
+                                {"node": 2, "startTime": "08:50", "endTime": "09:35"},
+                                {"node": 3, "startTime": "09:50", "endTime": "10:35"},
+                                {"node": 4, "startTime": "10:40", "endTime": "11:25"},
+                                {"node": 5, "startTime": "11:30", "endTime": "12:15"},
+                            ]
+                        ),
+                        json.dumps({"startDate": "2026-09-07", "maxWeek": 20, "nodes": 12}),
+                        json.dumps(
+                            [
+                                {"id": 0, "courseName": "毛泽东思想和中国特色社会主义理论体系概论"},
+                                {"id": 1, "courseName": "周末创新创业实践与人工智能综合实训课程"},
+                            ]
+                        ),
+                        json.dumps(
+                            [
+                                {
+                                    "id": 0,
+                                    "day": 5,
+                                    "startNode": 3,
+                                    "step": 3,
+                                    "startWeek": 1,
+                                    "endWeek": 18,
+                                    "type": 0,
+                                    "room": "金明综合楼2101 郑炳凯",
+                                    "teacher": "郑炳凯",
+                                },
+                                {
+                                    "id": 1,
+                                    "day": 7,
+                                    "startNode": 1,
+                                    "step": 2,
+                                    "startWeek": 1,
+                                    "endWeek": 18,
+                                    "type": 0,
+                                    "room": "软件学院实训中心502",
+                                    "teacher": "林教授",
+                                },
+                            ]
+                        ),
+                    ]
+                )
+            )
+            wk_map = long_course_wu.get_courses_for_week(date(2026, 11, 9), now=now_dt)
+            self.assertEqual(len(wk_map[5]), 1)
+            self.assertEqual(len(wk_map[7]), 1)
+            self.assertEqual(
+                wk_map[7][0].course_name, "周末创新创业实践与人工智能综合实训课程"
+            )
+
+            dummy_draw = FakeDraw()
+            card_layout = self.plugin.renderer._measure_course_card(
+                dummy_draw, wk_map[5][0], 664
+            )
+            joined_title = "".join(card_layout["course_lines"])
+            self.assertEqual(joined_title, "毛泽东思想和中国特色社会主义理论体系概论")
+            joined_meta = "".join(card_layout["meta_lines"])
+            self.assertIn("金明综合楼2101 郑炳凯", joined_meta)
         finally:
             rmod.HAS_PIL = orig_has_pil
 
