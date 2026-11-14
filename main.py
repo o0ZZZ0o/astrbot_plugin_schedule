@@ -177,7 +177,7 @@ def parse_valid_hhmm(raw: str) -> Optional[str]:
     "astrbot_plugin_schedule",
     "AstrBot Developer",
     "为AstrBot设计的课程表插件，支持.ics与WakeUp口令绑定、动态节次/课间/周数自适应、三种精美渲染样式、课前@提醒、早八前夜@提醒、周日下周上课情况排行推送，深度适配QQ官方机器人",
-    "1.4.0",
+    "1.4.1",
     "https://github.com/astrbot/astrbot_plugin_schedule",
 )
 class SchedulePlugin(Star):
@@ -1463,7 +1463,7 @@ class SchedulePlugin(Star):
     async def cmd_schedule_help(self, event: AstrMessageEvent):
         """显示课程表插件所有指令说明"""
         help_lines = [
-            "📖 【AstrBot 课程表插件指令列表 (v1.4.0)】",
+            "📖 【AstrBot 课程表插件指令列表 (v1.4.1)】",
             "1. /绑定课表 ：发送 .ics 文件或 WakeUp 分享口令绑定课表（自动识别每节课时间、时长、课间与周数）",
             "2. /查看课表 ：显示自己今天接下来要上的课程（图片）",
             "3. /今日课表 ：输出今日完整课表图片",
@@ -1706,7 +1706,7 @@ class SchedulePlugin(Star):
                     tomorrow_courses = sched.get_courses_for_date(
                         tomorrow, now=now, tz_name=self.timezone
                     )
-                    thresh_time = parse_hhmm(prof.early_eight_threshold or "08:00")
+                    thresh_time = parse_hhmm(prof.early_eight_threshold or "08:30")
                     early_courses = [
                         tc
                         for tc in tomorrow_courses

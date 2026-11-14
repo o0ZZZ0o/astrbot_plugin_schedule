@@ -38,7 +38,7 @@
   "default_early_eight_threshold": {
     "description": "默认早八课程判定时间（该时间及之前开始的课算作早八）",
     "type": "string",
-    "default": "08:00",
+    "default": "08:30",
     "hint": "格式为 HH:MM，如 08:00 或 08:30"
   },
   "default_sunday_push_time": {

@@ -1021,7 +1021,7 @@ class UserProfile:
     # 早八提醒配置（在有早八的前一天指定时间推送并 @用户）
     early_eight_enabled: bool = True  # 默认开启
     early_eight_remind_time: str = "21:30"  # 前一天几点提醒，如 21:30
-    early_eight_threshold: str = "08:00"  # 几点及之前开始的课算早八，如 08:00
+    early_eight_threshold: str = "08:30"  # 几点及之前开始的课算早八，默认 08:30
     early_eight_umo: str = ""
     last_early_eight_remind_date: str = ""
     # 周日推送下周上课情况配置
@@ -1087,7 +1087,7 @@ class UserProfile:
             reminded_classes=list(data.get("reminded_classes", [])),
             early_eight_enabled=bool(data.get("early_eight_enabled", True)),
             early_eight_remind_time=str(data.get("early_eight_remind_time", "21:30")),
-            early_eight_threshold=str(data.get("early_eight_threshold", "08:00")),
+            early_eight_threshold=str(data.get("early_eight_threshold", "08:30")),
             early_eight_umo=str(data.get("early_eight_umo", "")),
             last_early_eight_remind_date=str(
                 data.get("last_early_eight_remind_date", "")
