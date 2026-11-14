@@ -974,7 +974,7 @@ class ScheduleRenderer:
             m_week = sched.get_week_number(target_date)
             ongoing_c = next((c for c in day_courses if c.status == "ongoing"), None)
             next_c = next((c for c in day_courses if c.status in ("next", "upcoming")), None)
-            t_thresh = parse_hhmm(getattr(prof, "early_eight_threshold", "08:00") or "08:00")
+            t_thresh = parse_hhmm(getattr(prof, "early_eight_threshold", "08:30") or "08:30")
 
             if is_tomorrow:
                 if day_courses:
@@ -1138,7 +1138,7 @@ class ScheduleRenderer:
             wk_map = sched.get_courses_for_week(monday, now=now, tz_name=tz_name)
             wk_courses = [c for dlist in wk_map.values() for c in dlist]
             total_mins = sum(c.duration_minutes for c in wk_courses)
-            t_thresh = parse_hhmm(getattr(prof, "early_eight_threshold", "08:00") or "08:00")
+            t_thresh = parse_hhmm(getattr(prof, "early_eight_threshold", "08:30") or "08:30")
             ranking_rows.append(
                 {
                     "display_name": prof.get_display_name(group_id),
