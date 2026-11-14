@@ -1,6 +1,6 @@
 name: astrbot_plugin_schedule
 display_name: 课程表插件 (适配QQ官方机器人)
 desc: 帮助群组成员方便地管理和查询自己以及群友的课程安排，支持 .ics 与 WakeUp 口令绑定、动态节次/课程时长/课间/周数自适应调整、三种精美图片渲染、课前@提醒、早八前夜@提醒、周日下周上课情况排行推送，完美适配 QQ 官方机器人与 OneBot。
-version: 1.3.2
+version: 1.4.0
 author: AstrBot Developer
 repo: https://github.com/astrbot/astrbot_plugin_schedule
